@@ -79,6 +79,12 @@ stricter contract. This project closes that gap.
     low-priority hog** — rpi3's preemptive fixed-priority scheduler is genuinely
     real-time-shaped. Residual loaded-vs-idle gap ~100 µs is the dispatch latency
     to drive down.
+  - [x] **Cooperative-gap measured on rpi4** (`docs/p1_jitter_baseline.md`):
+    under a CPU hog, jitter grows with the hog's non-yielding run (unbounded);
+    a **1 kHz loop misses 82% of deadlines** (164/200) and rpi4's round-robin
+    preemption does **not** help — vs rpi3's 57 µs / 0 misses. ~45× worse.
+    (rpi5 skipped: its HTTP handler runs in the timer ISR, so proc-switching from
+    it is unsafe — itself a finding.)
   - [ ] Port that scheduler to rpi4/rpi5; make the timer a preempt source; move
     the network stack out of the timer ISR.
 - [ ] P2–P4.
