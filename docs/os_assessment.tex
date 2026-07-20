@@ -74,10 +74,55 @@ AIPL GC & --- & アクタ回収＋vheap ロック & \limt{タイマ駆動 sweep}
 \end{tabularx}
 \end{table}
 
+\section{P1 実装成果：rpi5 プリエンプティブ RT 化（実機実測）}\label{sec:p1}
+本書①スケジューラ・②タイマ/ISR の改良案を \textbf{rpi5 で実装し実機検証した}（2026-07、
+branch \code{manet-m14-udp}；commit \code{930a910} Stage 1／\code{4a42061} Stage 2／
+\code{5e0b267} 診断ルート）。要点は二つ。
+\begin{itemize}\itemsep1pt
+\item \textbf{固定優先度プリエンプティブ化}。\code{ready\_pop} を優先度順（同格 FIFO）に、
+\code{proc\_sleep\_us}+\code{PR\_SLEEP}+\code{proc\_timer\_tick}（tickless one-shot＝
+\code{timer\_arm\_before\_us} で CNTP 比較値を次締切へ）、EOI 後 \code{proc\_preempt} で
+最高優先度 ready を走らせる。
+\item \textbf{ネットワークスタックを ISR から追い出し}。\code{timer\_tick\_hook()} は
+\code{net\_wake()} のみを行い、専用 \code{net\_proc}（prio 1、唯一の非 NULL プロセス）が
+\code{genet\_rx\_tick()}＝RX／プロトコル／HTTP を\textbf{プロセス文脈}で回して \code{proc\_block()}。
+ISR は短く有界に。非再入の AIPL ランタイムは net\_proc 単独実行ゆえ保護される。
+\end{itemize}
+
+常設診断ルート \code{/rtos-jitter} で 1\,kHz 周期タスクの\textbf{解放ジッタ}を、idle と
+フルコア計算 hog 負荷下で実測した（表\ref{tab:jitter}）。\textbf{rpi5 はプリエンプト有効時に
+最大ジッタ 4\,µs・締切ミス 0}。協調（preempt off）では hog が 5\,ms ごとにしか譲らず
+\textbf{200/200 全ミス}——これが改良前の姿である。tickless one-shot により rpi5 の
+\textbf{ディスパッチ遅延は約 2\,µs}（平均 1002 vs 目標 1000\,µs）に収まり、3 世代中\textbf{最良の
+時間精度}に達した。
+
+\begin{table}[h]\centering
+\caption{1\,kHz 周期タスクの解放ジッタ（フルコア hog 負荷、実機 HTTP \code{/rtos-jitter}、samples=200）}\label{tab:jitter}
+\small
+\begin{tabularx}{\linewidth}{@{}lXrrr@{}}
+\toprule
+ボード & スケジューリング & 平均周期 & 最大ジッタ & 締切ミス \\
+\midrule
+rpi5（A76） & \textbf{プリエンプティブ＋tickless（P1）} & 1002\,µs & \textbf{4\,µs} & \textbf{0/200} \\
+rpi3（A53） & クラシック preemptive 優先度 & 1002\,µs & 53\,µs & 0/200 \\
+rpi4（A72） & プリエンプティブ（固定 100\,Hz tick） & 1494\,µs & 498\,µs & 0/200 \\
+\midrule
+rpi5（A76） & \limt{協調（preempt off）＝改良前相当} & 5018\,µs & 4044\,µs & \limt{200/200} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\fix{残る改良余地（ディスパッチ遅延）。} rpi5 は tickless で約 2\,µs だが、\textbf{rpi4 は固定
+100\,Hz tick のため周期が次 tick へ丸められ約 500\,µs のオフセット}を持つ（表\ref{tab:jitter} の
+平均 1494\,µs／最大ジッタ 498\,µs；締切ミスは 0）。rpi4 に rpi5 の tickless one-shot を移植すれば
+µs 級精度に到達可能で、これが次の P1 課題である。\code{/preempt} デモも両ボードで確認済み
+（preempt=1→\code{ABAB} インターリーブ、preempt=0→\code{AAAA..BBBB} ブロック実行）。
+
 \section{機構別の改良余地}
 
 \subsection{① スケジューラ／ディスパッチャ}
-\textbf{現状。} rpi5 の \code{system/proc.c:19-48} は\textbf{単一グローバル FIFO}（\code{ready\_push}
+\fix{【2026-07 更新：本項の改良案は rpi5 で実装・実測済み。→§\ref{sec:p1}】}
+\textbf{現状（監査時点）。} rpi5 の \code{system/proc.c:19-48} は\textbf{単一グローバル FIFO}（\code{ready\_push}
 末尾追加・\code{ready\_pop} 先頭取得）で、\code{proc\_resched()}（\code{proc.c:177-198}）は先頭を
 取り出して \code{ctxsw()} するだけ。\code{prio} は書かれるが（\code{proc.c:63,96,142}）\textbf{一度も
 読まれない}。\code{proc.h:12}「No preemption yet」。rpi4 も同じ FIFO で、プリエンプトは
@@ -96,7 +141,8 @@ aging・MLFQ・RCU 非プリエンプト区間まで実装済み。
 するのが最短。AIPL 非リエントラント問題は §7 の AMP／領域分離で解く（RT コアは AIPL 共有状態に触れない）。
 
 \subsection{② タイマ tick／プリエンプト源}
-\textbf{現状。} rpi5 は ARM generic timer 100\,Hz（\code{timer.h}, PPI 30）だが、
+\fix{【2026-07 更新：本項の改良案（プリエンプト源化・ネット処理の ISR 追い出し・tickless one-shot）は rpi5 で実装・実測済み。→§\ref{sec:p1}】}
+\textbf{現状（監査時点）。} rpi5 は ARM generic timer 100\,Hz（\code{timer.h}, PPI 30）だが、
 \code{device/timer/timer.c:48-56} の \code{timer\_irq\_handler()} は再武装と \code{tick\_count}++ と
 フックのみで\textbf{resched を呼ばない}。しかも \code{loader/main.c:250-260} の
 \code{timer\_tick\_hook()} が \code{genet\_rx\_tick()} を呼び、\textbf{イーサ RX ドレイン＋TCP/HTTP
