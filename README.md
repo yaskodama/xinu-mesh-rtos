@@ -85,8 +85,15 @@ stricter contract. This project closes that gap.
     preemption does **not** help — vs rpi3's 57 µs / 0 misses. ~45× worse.
     (rpi5 skipped: its HTTP handler runs in the timer ISR, so proc-switching from
     it is unsafe — itself a finding.)
-  - [ ] Port that scheduler to rpi4/rpi5; make the timer a preempt source; move
-    the network stack out of the timer ISR.
+  - [x] **Ported preemptive fixed-priority scheduling to rpi4** — priority
+    `ready_pop`, `proc_sleep_us` + timer-driven wakeup, tick 100→1000 Hz, RT
+    procs isolated from the cooperative AIPL actor pump. Real-HW result: a
+    high-priority 10 ms task holds its period at **~1 ms jitter with 0 deadline
+    misses under a full-core CPU hog** (was 10 ms / 60-of-60 cooperatively),
+    matching rpi3. Root cause of the first miss (new procs dispatched IRQ-masked
+    so the timer couldn't preempt them) found via `[diag]` counters and fixed.
+  - [ ] Generalise the entry IRQ-enable (a `proc_create` trampoline); tickless
+    one-shot for true 1 kHz; port to rpi5 (handler runs in the timer ISR).
 - [ ] P2–P4.
 
 ## Related

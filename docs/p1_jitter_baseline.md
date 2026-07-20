@@ -101,3 +101,57 @@ entirely about behaviour *under load*.)
 zero misses versus rpi4's cooperative kernel.** This is the empirical case for P1:
 port rpi3's `resched` to rpi4/rpi5, drive it from the timer, and keep RT control
 tasks off the non-reentrant AIPL runtime (AMP) so preemption is never suppressed.
+
+---
+
+# P1 result — preemptive RT scheduling ported to rpi4
+
+Ported rpi3's priority + preemption model onto rpi4's cooperative kernel
+(`xinu-rpi4`, `system/proc.c` / `device/timer/timer.c`), **without touching the
+non-reentrant AIPL runtime**:
+
+- `ready_pop()` now returns the **highest-priority** ready proc (the `prio`
+  field was previously never read).
+- `proc_sleep_us()` (a new `PR_SLEEP` state) + `proc_timer_tick()`: the timer
+  readies due sleepers and requests a preemptive switch, so a high-priority
+  periodic task **wakes on time and preempts** lower-priority compute. Tick
+  raised 100 → 1000 Hz.
+- Only procs that call `proc_sleep_us()` sleep/preempt; **resident actors keep
+  running cooperatively** under the existing `g_actor_pump` guard.
+
+**Root cause of the first failed attempt** (found via `[diag]` counters):
+`proc_preempt` was called only ~50×/s instead of 1000×/s during a CPU hog —
+because a newly-dispatched compute proc inherited the dispatcher's masked-IRQ
+state (the `ctxsw` runs inside `proc_resched`'s `irq_save`) and, being a tight
+loop, never re-enabled interrupts, so **the timer never preempted it**. RT procs
+now enable IRQs at entry (`msr daifclr, #2`).
+
+## Result (period 10 ms, 20 ms CPU hog)
+
+| | max jitter | deadline misses | preempts fired (`[diag]`) |
+|---|---:|:---:|---|
+| **preempt=1 (RT)** | **1 012 µs** | **0** | 660 |
+| preempt=0 (cooperative) | 10 042 µs | 60 / 60 | 0 |
+
+With preemption on, **`[idle]` and `[loaded]` are identical** (11 ms period,
+~1 ms jitter, 0 misses): the high-priority periodic task holds its period under
+a full-core CPU hog — matching rpi3. Regression-clean (boot, `/manet`, `/bench`
+SMP 4×, actors all fine).
+
+The residual ~1 ms jitter is the 1 kHz tick quantization; a 1 kHz *servo* period
+sits at that limit (needs a tickless one-shot timer to reach rpi3's ~57 µs).
+
+## Updated three-generation picture
+
+| board | scheduler | 10 ms period under CPU load | 1 kHz servo |
+|-------|-----------|:---------------------------:|:-----------:|
+| rpi3 | preemptive priority (native) | ~0.06 ms jitter, 0 miss | 57 µs, 0 miss |
+| **rpi4** | **preemptive priority (ported)** | **~1 ms jitter, 0 miss** | tick-limited (~1 ms) |
+| rpi5 | cooperative (port pending) | — | — |
+
+## Next
+
+- Generalise the entry IRQ-enable (a `proc_create` trampoline) so every proc —
+  not just RT ones — starts with interrupts on.
+- Tickless one-shot timer for sub-tick (µs) periodic precision → true 1 kHz.
+- Port the same to rpi5 (harder: its HTTP handler runs in the timer ISR).
