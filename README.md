@@ -72,9 +72,15 @@ stricter contract. This project closes that gap.
     unbounded latency; no RT-memory pinning API.
   - The **AIPL GC is a stop-the-world actor sweep** driven from the timer path
     (`main.c:99`, ~8 s), and the value heap is a 32 KiB bump arena.
-- [ ] **P1** — preemptive fixed-priority scheduler (port rpi3's `resched`) +
-  timer-as-preempt-source + move the net stack out of the ISR + a µs jitter
-  harness. *Next.*
+- [~] **P1** — *in progress.*
+  - [x] µs **jitter-measurement harness** on rpi3 (`/rtos-jitter`) + **baseline
+    captured** (`docs/p1_jitter_baseline.md`): a 1 kHz periodic task holds its
+    period with **<60 µs jitter and zero deadline misses even under a full-core
+    low-priority hog** — rpi3's preemptive fixed-priority scheduler is genuinely
+    real-time-shaped. Residual loaded-vs-idle gap ~100 µs is the dispatch latency
+    to drive down.
+  - [ ] Port that scheduler to rpi4/rpi5; make the timer a preempt source; move
+    the network stack out of the timer ISR.
 - [ ] P2–P4.
 
 ## Related
