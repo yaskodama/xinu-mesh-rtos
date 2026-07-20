@@ -9,7 +9,10 @@ custom actor language), with a target of **12 Xinu nodes**, one per joint /
 subsystem.
 
 The full write-up (background, gap analysis, roadmap, risks) is in
-**[`docs/rtos_plan.pdf`](docs/rtos_plan.pdf)** (`docs/rtos_plan.tex`).
+**[`docs/rtos_plan.pdf`](docs/rtos_plan.pdf)** (`docs/rtos_plan.tex`), and a
+**code-level assessment** of where the real kernels fall short — with file:line
+evidence across all three ports — is in
+**[`docs/os_assessment.pdf`](docs/os_assessment.pdf)** (`docs/os_assessment.tex`).
 
 ## Where we are
 
@@ -54,8 +57,24 @@ stricter contract. This project closes that gap.
 ## Status
 
 - [x] Plan document (`docs/rtos_plan.pdf`).
-- [ ] **P1** — jitter-measurement harness on a board (in progress); baseline
-  numbers next.
+- [x] **Code-level OS assessment** (`docs/os_assessment.pdf`) — the 6 mechanisms
+  audited against the real kernels. Headline findings:
+  - **rpi3 is the only port with a real-time-shaped scheduler** (preemptive,
+    priority, + EDF/MLFQ/aging/RCU hooks); it is the natural RT base.
+  - **rpi5 has no preemption** (`proc.h:12`), its ready list is FIFO with the
+    `prio` field never read, and it runs the **entire network stack inside the
+    100 Hz timer ISR** (unbounded ISR).
+  - **rpi4/rpi5 semaphores are non-blocking stubs** (`xinu_compat.c:88`) — no
+    real synchronization; the actor mailbox **drops on overflow** (`cc.c:532`).
+  - **No priority inheritance anywhere**; unbounded priority inversion is
+    structurally possible.
+  - **rpi5 demand-pages** (`mmu.c:267`) and uses first-fit `getmem` — both inject
+    unbounded latency; no RT-memory pinning API.
+  - The **AIPL GC is a stop-the-world actor sweep** driven from the timer path
+    (`main.c:99`, ~8 s), and the value heap is a 32 KiB bump arena.
+- [ ] **P1** — preemptive fixed-priority scheduler (port rpi3's `resched`) +
+  timer-as-preempt-source + move the net stack out of the ISR + a µs jitter
+  harness. *Next.*
 - [ ] P2–P4.
 
 ## Related

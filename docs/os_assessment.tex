@@ -1,0 +1,211 @@
+% !TEX program = xelatex
+% Xinu OS 改良余地アセスメント（RTOS 化に向けたコードレベル検討）
+\documentclass[11pt,a4paper]{article}
+\usepackage[a4paper,margin=20mm]{geometry}
+\usepackage{xeCJK}
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\setCJKmainfont{Hiragino Mincho ProN}
+\setCJKsansfont{Hiragino Sans}
+\setCJKmonofont{Hiragino Sans}
+\setmonofont{Menlo}[Scale=0.78]
+\xeCJKDeclareCharClass{CJK}{"2460 -> "24FF, "2013 -> "2015, "2018 -> "201F, "2026, "2500}
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue!60!black,
+  pdftitle={Xinu OS 改良余地アセスメント（RTOS 化）}, pdfauthor={児玉靖司}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\limt}[1]{\textbf{\textcolor{red!55!black}{#1}}}
+\newcommand{\fix}[1]{\textbf{\textcolor{green!35!black}{#1}}}
+
+\title{\textbf{Xinu の OS としての改良余地アセスメント}\\[2mm]
+  \large AIPL 駆動フィジカル AI（アーム型ロボット）RTOS 化に向けたコードレベル検討\\[1mm]
+  \normalsize ―― rpi3(A53) / rpi4(A72) / rpi5(A76) 実カーネルの精査 ――}
+\author{児玉靖司\\\small 法政大学経営学部}
+\date{2026 年 7 月 20 日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+AIPL でプログラミングし、最終的にアーム型ロボットを\textbf{12 台の Xinu ノード}で制御する
+フィジカル AI 向け RTOS を作る構想の前段として、\textbf{現行 Xinu 3 ポートの実カーネルを精査}し、
+OS としての改良余地を\textbf{ファイル:行}レベルで洗い出した。結論から言えば、\textbf{3 ポートは
+別物のカーネル}である。rpi3 は\textbf{クラシック Embedded Xinu}（プリエンプティブ・優先度スケジューラ、
+EDF/MLFQ/aging/RCU の RT 実験つき）で\textbf{唯一 RT の骨格を持つ}。rpi4/rpi5 は AIPL アクタ実行に
+最適化した\textbf{協調型}カーネルで、rpi5 は\textbf{プリエンプション皆無}・rpi4 は既定オフの
+ラウンドロビンのみ。本書は 6 機構（スケジューラ／タイマ／割込み／IPC／メモリ／AIPL GC）ごとに
+「現状の実装」「RTOS 上の限界」「改良案」を対にして示し、最後に\textbf{優先順の改良ロードマップ}
+（rtos\_plan の P1--P4 をコード実態で肉付け）と\textbf{アーム型 12 ノードへの指針}を与える。
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+\section{総括}
+アーム型ロボットの関節制御（例：1\,kHz サーボループ）は、\textbf{高優先度タスクが即座に
+プリエンプトして走り、締切を守る}ことを要求する。現行 Xinu の到達度は表\ref{tab:summary} の通り。
+\textbf{rpi3 のみが RT 型スケジューラ}を持ち、RT 化の自然な基盤である。rpi4/rpi5 は
+\textbf{協調型・非ブロッキング同期・非有界 ISR}であり、そのままでは硬い実時間保証を満たさない。
+
+\begin{table}[h]\centering
+\caption{RTOS 観点の 3 ポート比較（実コード根拠つき）}\label{tab:summary}
+\scriptsize
+\begin{tabularx}{\linewidth}{@{}lXXX@{}}
+\toprule
+機構 & rpi3（クラシック Xinu） & rpi4（独自） & rpi5（独自） \\
+\midrule
+スケジューリング & プリエンプティブ\textbf{優先度}＋EDF/MLFQ/aging \code{resched.c:78-116} & 協調 FIFO；RR プリエンプト既定オフ \code{proc.c:288-296} & 協調 FIFO；\limt{プリエンプション無}・\code{prio} 未使用 \code{proc.h:12} \\
+プロセス上限 & \code{NTHREAD 100} & \code{NPROC 2048} & \limt{\code{NPROC 8}} \\
+tick／プリエンプト源 & BCM clk \textbf{1000\,Hz}→\code{resched()} \code{clkhandler.c:52} & CNTP 100\,Hz→\code{resched\_request()} & \limt{CNTP 100\,Hz→I/O のみ、resched 無} \\
+セマフォ／mbox & FIFO ブロッキング \code{wait.c:44} & \limt{非ブロッキング stub} & \limt{非ブロッキング stub} \code{xinu\_compat.c:88} \\
+優先度継承 & \limt{無（FIFO 待ち）} & \limt{無（ロック横取り）} & \limt{無} \\
+アロケータ & first-fit & first-fit & first-fit \code{memory.c:32} \\
+デマンドページング & 無 & 無 & \limt{有・ページフォルト} \code{mmu.c:267} \\
+AIPL GC & --- & アクタ回収＋vheap ロック & \limt{タイマ駆動 sweep} \code{main.c:99} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{機構別の改良余地}
+
+\subsection{① スケジューラ／ディスパッチャ}
+\textbf{現状。} rpi5 の \code{system/proc.c:19-48} は\textbf{単一グローバル FIFO}（\code{ready\_push}
+末尾追加・\code{ready\_pop} 先頭取得）で、\code{proc\_resched()}（\code{proc.c:177-198}）は先頭を
+取り出して \code{ctxsw()} するだけ。\code{prio} は書かれるが（\code{proc.c:63,96,142}）\textbf{一度も
+読まれない}。\code{proc.h:12}「No preemption yet」。rpi4 も同じ FIFO で、プリエンプトは
+\code{g\_preempt\_on} 既定オフかつアクタポンプ中は抑止（\code{proc.c:293}、非リエントラントな
+AIPL/LLM ランタイム共有のため意図的）。対して rpi3 の \code{system/resched.c:51-121} は
+\textbf{最高優先度 ready を選ぶ}（\code{dequeue(readylist)}、キー順キュー）、しきい値
+\code{resched.c:78} で同格は FIFO＋量子 RR、さらに EDF 締切ヒント（\code{s3\_pick\_deadline}）・
+aging・MLFQ・RCU 非プリエンプト区間まで実装済み。
+
+\limt{RTOS 上の限界。} rpi4/rpi5 は「最高優先度 ready が走る」を実現できない。制御タスクが
+下位の計算/LLM タスクをプリエンプトできず、自発 yield 待ち。rpi5 の \code{NPROC 8} は多関節アームに
+過少。
+
+\fix{改良案。} rpi4/rpi5 に\textbf{固定優先度プリエンプティブ}スケジューラを導入（ready を
+優先度キー付きキュー化、tick で最高優先度をディスパッチ）。基盤は\textbf{rpi3 の resched を移植}
+するのが最短。AIPL 非リエントラント問題は §7 の AMP／領域分離で解く（RT コアは AIPL 共有状態に触れない）。
+
+\subsection{② タイマ tick／プリエンプト源}
+\textbf{現状。} rpi5 は ARM generic timer 100\,Hz（\code{timer.h}, PPI 30）だが、
+\code{device/timer/timer.c:48-56} の \code{timer\_irq\_handler()} は再武装と \code{tick\_count}++ と
+フックのみで\textbf{resched を呼ばない}。しかも \code{loader/main.c:250-260} の
+\code{timer\_tick\_hook()} が \code{genet\_rx\_tick()} を呼び、\textbf{イーサ RX ドレイン＋TCP/HTTP
+スタックを割込みコンテキストで実行}する。rpi3 は BCM clk \textbf{1000\,Hz}（\code{clock.h:20}）で
+\code{clkhandler.c:52-59} が毎 tick \code{resched()}＝真のプリエンプション。
+
+\limt{RTOS 上の限界。} rpi5 は周期タイマを持ちながらスケジューリングに使わず、暴走計算区間が
+全タスクを止める。\textbf{ネットワークスタック全体を ISR 内}で回すため ISR 実行時間が
+非有界—RTOS が求める「短く有界な ISR」の正反対。
+
+\fix{改良案。} タイマ IRQ を\textbf{プリエンプション源}に接続（rpi4 は \code{resched\_request} 済み、
+有効化＋優先度対応）。\textbf{ネットワーク処理を ISR から底半分／スレッドへ}追い出し ISR を短縮。
+精密締切には\textbf{tickless one-shot}（CNTP 比較値を次締切に設定）を併設。tick 安定性
+（rpi3 の \code{clkhandler.c:52} は sleepq 非空時に resched を飛ばす癖）も是正。
+
+\subsection{③ 割込み処理と遅延}
+\textbf{現状。} GIC（\code{system/irq\_dispatch.c}、\code{IRQ\_TABLE\_MAX 256}）。スケジューラ臨界区は
+\code{irq\_save/restore}（rpi4 \code{proc.c:233-338}、短い）。\limt{非有界スピンが真の遅延源}：
+\code{system/smp.c:30} \code{SMP\_WAIT\_LIMIT 2000000000}（約 2$\times10^9$ 反復＝\textbf{秒}オーダ）で
+core0 がワーカ完了を待つ（\code{smp.c:205-216}）。rpi4 \code{proc.c:63} \code{AIPL\_SPIN\_LIMIT 300000}
+の vheap ロック待ち。
+
+\limt{RTOS 上の限界。} SMP ディスパッチ経路に\textbf{数秒の最悪スピン}、ISR は重処理（②）。
+割込み遅延が短くも有界でもなく、スレッド化 IRQ／優先度も無い。
+
+\fix{改良案。} 全待ちを\textbf{有界・イベント駆動}へ（\code{SMP\_WAIT\_LIMIT} を時間予算＋
+フォールバックに、スピンを条件変数/セマフォ待ちに）。\textbf{スレッド化 IRQ}で ISR 最小化、
+割込み遅延（latency＋jitter）を\textbf{実測・上限提示}するハーネスを常設（P1）。
+
+\subsection{④ IPC／同期}
+\textbf{現状。} \limt{rpi4/rpi5 のセマフォ／mbox は非ブロッキング stub}：rpi5
+\code{xinu\_compat.c:88-97} の \code{wait()} は \code{count--} して即 OK、負でも\textbf{ブロックしない};
+\code{signal()} は \code{count++} のみ。mbox もその上に構築。AIPL アクタの実 IPC は
+\code{cc/cc.c:527-532} の\textbf{単一ロックフリーリング}で、\code{cc.c:532}「mailbox full: drop」＝
+\textbf{溢れると黙って捨てる}。\limt{優先度継承はどこにも無い}：rpi4 の vheap ロックは
+\code{AIPL\_SPIN\_LIMIT} 超で\textbf{ロックを横取り}（\code{proc.c:369-382}、相互排他を破る）、
+rpi3 セマフォは待ちを\textbf{FIFO}で並べる（\code{wait.c:44}）。
+
+\limt{RTOS 上の限界。} \textbf{非有界の優先度逆転}が構造的に可能。rpi4/rpi5 の「セマフォ」は
+ブロックしないので RT の相互排他・条件同期に使えない。制御用途で\textbf{メッセージをドロップ}するのは不可。
+
+\fix{改良案。} RT パスに\textbf{ブロッキング・優先度対応キュー}＋\textbf{優先度継承}（PIP）または
+\textbf{優先度上限プロトコル}（PCP/immediate ceiling）を導入。アクタ mailbox に\textbf{有界＋
+バックプレッシャ}（満杯時は送信側をブロック or 明示エラー、決して黙ドロップしない）。rpi3
+セマフォ待ち行列を\textbf{優先度順}へ。
+
+\subsection{⑤ メモリ管理}
+\textbf{現状。} rpi5 \code{mem/memory.c:32-62} の \code{getmem()} は\textbf{first-fit}（自由リストを走査、
+\code{memory.c:40}）で O(n)。\limt{rpi5 はデマンドページング}：\code{system/mmu.c:207-286} が VA 窓
+\code{[0x8\_0000\_0000,+4\,MiB)} を L3 無効のまま置き、初回タッチで \code{vm\_fault()}
+（\code{mmu.c:267-286}）がフレーム確保＋\textbf{4\,KiB ゼロ埋め}＋\code{dsb/tlbi/isb}、
+\code{exception.c:55-74} で再実行。プール 512 フレーム、枯渇で致命。RT メモリを\textbf{ピン留め／
+事前フォルトする API は無い}。
+
+\limt{RTOS 上の限界。} first-fit は\textbf{データ依存・断片化依存の非決定的遅延}。デマンドページングは
+\textbf{ページフォルト＋ゼロ埋め＋TLB 保守}を制御ループに注入。硬い制御には致命的。
+
+\fix{改良案。} RT 用に\textbf{固定ブロック／プール（O(1)）}アロケータ、RT タスクメモリの
+\textbf{ピン留め・事前フォルト（フォルト禁止）}、RT 領域を\textbf{デマンド窓の外}に置く。
+アクタ・メッセージは\textbf{事前確保}（RT パス無割当）。
+
+\subsection{⑥ AIPL ランタイムと GC}
+\textbf{現状。} アクタ実行は \code{cc/cc.c}（\code{g\_alive[]}/\code{g\_protect[]}/\code{g\_nact}）。
+\limt{周期 GC が存在}：rpi5 \code{loader/main.c:92-106} の \code{gc\_drive()} が
+\code{genet\_rx\_tick()}（＝100\,Hz タイマ／wm ループ）から約 8\,s 毎に呼ばれ、\code{cc\_actor\_gc}
+で idle$>$20\,s のアクタを回収。\code{cc.c:563-577} の \code{gc\_sweep\_core()} は\textbf{全アクタを走査}
+（O(actors)、stop-the-world）。値メモリは \code{g\_vheap[32768]} の\textbf{bump アリーナ}
+（\code{cc.c:185-192}）で\textbf{実行中は回収されず}、32\,KiB 枯渇で \code{vheap\_alloc} 失敗。
+
+\limt{RTOS 上の限界。} 制御ループが同一ランタイムを共有すると、約 8\,s 毎の\textbf{O(actors) sweep}に
+割り込まれ得る。rpi4 は cc 実行を vheap ロックで囲む（\code{proc.c:340-386}）ため GC/ヒープ競合が
+スピン/横取りを誘発。bump vheap は\textbf{漸進回収なし・32\,KiB 上限}で非決定的。
+
+\fix{改良案。} \textbf{RT 制御パスを AIPL 値ヒープ／GC ドメインの外}に出す（RT アクタは無割当・
+事前確保）。または\textbf{インクリメンタル／リージョン GC}で停止を有界化。best-effort 領域と
+RT 領域の\textbf{ヒープ分離}。GC を\textbf{タイマ ISR 経路から外す}。
+
+\section{改良ロードマップ（優先順、コード実態版）}
+rtos\_plan の P1--P4 を、上記の実コード所見に対応づける。
+
+\begin{enumerate}[leftmargin=1.8em,itemsep=3pt]
+\item[\textbf{P1}] \textbf{プリエンプティブ固定優先度スケジューラ＋タイマ堅牢化＋µs ジッタ計測}
+  （①②③）。\textbf{rpi3 の \code{resched} を基盤}に、rpi4/rpi5 の tick をプリエンプト源へ接続、
+  ネットワークを ISR から追い出す。\textbf{受入}：1\,kHz 周期タスクの release jitter を µs 計測し
+  上限内、割込み遅延を実測提示。
+\item[\textbf{P2}] \textbf{決定性の確保}（④⑤⑥）：ブロッキング優先度キュー＋\textbf{優先度継承}、
+  非有界スピン（\code{SMP\_WAIT\_LIMIT} 等）撲滅、RT メモリのプール化＋ピン留め、RT パスの
+  AIPL GC ドメイン分離。\textbf{受入}：RT パスで GC/フォルト/非有界待ち/優先度逆転が 0。
+\item[\textbf{P3}] \textbf{AMP パーティショニング}＋\textbf{安全}：制御コアを裸で隔離
+  （非リエントラント AIPL 問題を根本回避）、ウォッチドッグ＋締切超過→セーフトルク、
+  Capability＋MMU 領域でアクタ隔離。
+\item[\textbf{P4}] \textbf{決定的ノード間通信＋時刻同期・分散スケジューラ・AIPL の timing/effect 型}を
+  整備し 12 ノードへ。WiFi は非 RT 副系、制御は有線フィールドバス（CAN/EtherCAT/TSN）＋PTP。
+\end{enumerate}
+
+\section{アーム型 12 ノードへの指針}
+非リエントラントな AIPL ランタイムと硬い制御を両立する鍵は\textbf{AMP（役割固定）}である。
+「12 Xinu」構想は\textbf{関節／サブシステムごとに独立 RT パーティション}と自然に一致する：
+各関節ノードは\textbf{RT 制御コアを AIPL 共有状態から隔離}し、無割当・事前確保のサーボループを
+固定優先度で回す。計画・知覚など best-effort は別コア／別ノードで AIPL 駆動。ノード間は
+\textbf{決定的フィールドバス＋PTP 時刻同期}、締切ミスは\textbf{局所セーフ状態}に封じ込める。
+AIPL 側は\textbf{周期・締切・WCET を型／効果で宣言}し、コンパイラが優先度付き RT タスクへ写像・
+スケジュール可能性を静的判定する（差別化点）。
+
+\section{結論}
+現行 Xinu を実コードで精査した結果、\textbf{rpi3 が唯一 RT 型スケジューラを持つ}が優先度継承と
+優先度順待ち行列を欠き、\textbf{rpi4/rpi5 は協調型・非ブロッキング同期・非有界 ISR・デマンド
+ページング・タイマ駆動 GC}で、そのままでは硬い実時間保証を満たさない。改良の投資対効果が
+最も高いのは\textbf{P1（プリエンプティブ固定優先度＋タイマ堅牢化＋ジッタ実測）}で、以降の
+すべての基礎になる。基盤としては\textbf{rpi3 の resched を出発点}に、AMP による RT／best-effort
+分離で AIPL 非リエントラント問題を回避する道筋が最も現実的である。
+\end{document}
