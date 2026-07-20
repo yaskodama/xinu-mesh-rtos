@@ -155,3 +155,45 @@ sits at that limit (needs a tickless one-shot timer to reach rpi3's ~57 µs).
   not just RT ones — starts with interrupts on.
 - Tickless one-shot timer for sub-tick (µs) periodic precision → true 1 kHz.
 - Port the same to rpi5 (harder: its HTTP handler runs in the timer ISR).
+
+---
+
+# P1 #1 + #2 — general IRQ-enable + tickless one-shot (rpi4)
+
+**#1 — general entry IRQ-enable.** The per-harness `msr daifclr` was replaced by
+a `proc_create` trampoline (`ctxsw.S`: `msr daifclr #2; br x19`), so **every**
+process starts with interrupts enabled — the fix belongs in dispatch, not the
+workload. Verified: RT still holds ~1 ms jitter / 0 misses with no harness hack;
+boot / SMP / actors regression-clean.
+
+**#2 — tickless one-shot timer.** The fixed 1 kHz periodic reload became a
+one-shot armed at the next RT deadline (`proc_next_delay_us()`; `proc_sleep_us`
+arms via `timer_arm_before_us`), with a 1 ms floor for round-robin preemption.
+Sub-tick precision for every period:
+
+| period | periodic 1 kHz tick | **tickless one-shot** | misses |
+|-------:|--------------------:|----------------------:|:------:|
+| 10 ms  | 1 012 µs | **156 µs** | 0 |
+| 1 ms (1 kHz) | ~1 ms (300/500 miss) | **228 µs** | **0** |
+
+Period-to-period *variation* is only ~2 µs (the ~150–230 µs figure is a fixed
+per-period overhead offset, not jitter). A 1 kHz servo now holds 0 misses under a
+full-core CPU hog.
+
+**Known limitation:** back-to-back jitter tests with no gap can leave a measurer
+proc mid-teardown and storm the one-shot → total hang (power-cycle to recover).
+Space tests out; hardening (larger MIN floor / explicit sleeper cleanup) is the
+next step.
+
+## Three-generation picture (final)
+
+| board | scheduler | 10 ms under load | 1 kHz servo under load |
+|-------|-----------|:----------------:|:----------------------:|
+| rpi3 | preemptive priority (native) | ~0.06 ms, 0 miss | 57 µs, 0 miss |
+| **rpi4** | **preemptive priority + tickless (ported)** | **156 µs, 0 miss** | **228 µs, 0 miss** |
+| rpi5 | cooperative (port pending) | — | — |
+
+rpi4 now matches rpi3's real-time behaviour — a high-priority periodic task holds
+its period with zero deadline misses under a full-core CPU hog, at both 100 Hz
+and 1 kHz — while the non-reentrant AIPL actor runtime keeps running
+cooperatively (untouched). Next: harden the one-shot; port to rpi5.
