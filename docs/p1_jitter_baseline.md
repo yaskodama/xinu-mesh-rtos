@@ -180,10 +180,12 @@ Period-to-period *variation* is only ~2 µs (the ~150–230 µs figure is a fixe
 per-period overhead offset, not jitter). A 1 kHz servo now holds 0 misses under a
 full-core CPU hog.
 
-**Known limitation:** back-to-back jitter tests with no gap can leave a measurer
-proc mid-teardown and storm the one-shot → total hang (power-cycle to recover).
-Space tests out; hardening (larger MIN floor / explicit sleeper cleanup) is the
-next step.
+**Hardened (fixed):** the one-shot could fire as fast as 25 µs; with the per-IRQ
+proctab scan, back-to-back tests could storm it and starve the net process into
+a total hang. Raising the hard minimum between fires to **200 µs** makes any
+storm a survivable slowdown — the previously-hanging back-to-back sequence now
+runs through and the board stays alive, still 0 misses (1 kHz 403 µs, 10 ms
+209 µs). 200 µs is well below the periods used, so no practical precision loss.
 
 ## Three-generation picture (final)
 
