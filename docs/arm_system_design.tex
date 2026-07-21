@@ -10,6 +10,7 @@
 \usepackage{array}
 \usepackage{enumitem}
 \usepackage{xcolor}
+\usepackage{graphicx}
 \usepackage{hyperref}
 
 \setCJKmainfont{Hiragino Mincho ProN}
@@ -20,14 +21,15 @@
 \xeCJKDeclareCharClass{CJK}{"2460 -> "24FF, "2013 -> "2015, "2018 -> "201F, "2026, "2500}
 
 \hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue!60!black,
-  pdftitle={DOFBOT × Xinu メッシュ 12台 システム設計},
+  pdftitle={DOFBOT × Xinu メッシュ 6台 システム設計 (第2版)},
   pdfauthor={児玉靖司}}
 
 \newcommand{\code}[1]{\texttt{#1}}
 \newcommand{\prob}[1]{\textbf{\textcolor{red!55!black}{#1}}}
 \newcommand{\good}[1]{\textbf{\textcolor{green!45!black}{#1}}}
 
-\title{DOFBOT × Xinu メッシュ 12 台\\ \large システム全体設計}
+\title{DOFBOT × Xinu メッシュ 6 台\\ \large システム全体設計（第 2 版）\\
+       \normalsize Capability 推論による役割分担・冗長化・アクター移動}
 \author{}
 \date{2026年7月21日}
 
@@ -36,206 +38,404 @@
 
 \begin{abstract}
 \noindent
-6 軸アーム DOFBOT を、12 台の Xinu メッシュと強化学習で「次第にうまく動作する」
-システムとして構成するための設計。結論は 2 つ。
-\good{学習は Mac、推論は Xinu メッシュ}に置く（actor--learner 分離）。
-そして\prob{メッシュを渡る周期は 10\,Hz を超えてはならない} ---
-本日実測した往復レイテンシが中央値 15--130\,ms、裾が秒単位だからである。
-本書はこの制約を出発点に、4 層のアーキテクチャ、データ経路、
-段階的な導入計画、そして着手前に潰すべき前提条件を示す。
+第 1 版は 12 台を静的な ServoMotor/ServoSensor 対として扱い、当初構想の中核である
+\textbf{Capability 推論による役割分担・冗長性・アクターの動的移動}を設計に反映して
+いなかった。本版はそれを中心に据えて構成し直す。
+
+中心となる主張は 1 つ。\good{アクターの効果集合から、配置・複製可否・
+フェイルオーバの手順が機械的に決まる}。純粋なアクターは自由に複製でき、
+外部作用を持つアクターは\textbf{同時に 1 つしか存在してはならない} ---
+つまりフェイルオーバとは Capability の移譲そのものである。
+
+ただし現状 2 つの障害がある。\prob{効果格子が「自己状態の変更」と「外部への作用」を
+同一視している}こと、そして\prob{実測レイテンシの裾が秒単位}であること。
+前者は型システムの小さな拡張で解ける。後者は解けないので、
+\textbf{フェイルオーバは秒オーダである}という前提で安全性を設計する。
 \end{abstract}
 
-\section{設計の出発点 --- 実測値}
+\section{当初構想と第 1 版のずれ}
 
-設計判断はすべて 2026-07-21 に実機 3 台で測った次の値に基づく。
-全ボード同一エンドポイント (\code{/api/actors})、Mac から 200 回、10\,ms 間隔。
+当初の構想は次のとおりであった。
 
-\begin{center}
-\begin{tabular}{@{}l r r r r r@{}}
-\toprule
-\textbf{ボード} & \textbf{中央値} & \textbf{p95} & \textbf{p99} & \textbf{最大} & \textbf{失敗率}\\
-\midrule
-Pi 3 (BCM2837) & \textbf{15.3\,ms} & 2022\,ms & 3009\,ms & 3012\,ms & \prob{14\,\%}\\
-Pi 5 (BCM2712) & 36.3\,ms & 38.4\,ms & 84.3\,ms & 319\,ms & 0\,\%\\
-Pi 4 (BCM2711) & \prob{130.3\,ms} & 166\,ms & 183\,ms & 543\,ms & 0\,\%\\
-\bottomrule
-\end{tabular}
-\end{center}
+\begin{quote}
+AIPL のアクターを生成し、Capability 推論で役割分担させ、6 軸に対して 2 台ずつ
+Xinu を用意して冗長性を持たせ、アクターの移動を動的に行い、全体として効率の良い
+リアルタイム OS とする。
+\end{quote}
 
-この表から設計上の制約が 3 つ導かれる。
+第 1 版はこのうち「6 軸 $\times$ 2 台」だけを写し取り、残りを落としていた。
+Capability は役割の\textbf{説明}に使われるだけで設計判断に効いておらず、
+冗長性は台数の話に留まり、アクター移動に至っては触れていない。本版で立て直す。
 
-\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
-\item \prob{メッシュをサーボ制御ループに入れてはならない}。1\,kHz ループの
-      ジッタ許容 0.1\,ms に対し、最良の中央値でも 15\,ms、裾は秒単位。
-\item \prob{メッシュを渡る周期は 10\,Hz 以下}。p99 が 183\,ms (Pi 4) あるため、
-      100\,ms 周期でも取りこぼす。ノード側で内挿する前提で 10\,Hz とする。
-\item \prob{通信は欠落前提で設計する}。Pi 3 は 14\,\% が失敗した。
-      要求--応答ではなく、最新値が上書きされるデータグラム型が適する。
-\end{enumerate}
+\section{現物 --- CG シミュレータ}
 
-なお Pi 3 の失敗と 2 秒の裾は原因が特定できている（単一 accept の HTTP サーバに
-要求が重なると詰まる）。修正はコミット済みで未デプロイ。Pi 4 の 130\,ms は
-\textbf{原因未究明}であり、有線接続で Pi 5 の 3.6 倍という異常値である。
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig/sim_cg.png}
+\caption{DOFBOT ライン作業シミュレータ（\code{:8022}）。2026-07-21 実行、
+\code{node test/verify.mjs} で全項目合格した状態。左は 3D の作業セル
+（銀色ホーンの丸数字が実機サーボ ID 1--6 に対応）、右上は手首カメラの映像と
+TinyML の分類結果（緑・六角柱 100\,\%）、中央右は\textbf{実行中の AIPL ソースで、
+現在実行している行が強調表示}される（\code{PlannerActor} 268 行目）、
+右下が\textbf{Actor / Capability パネル}で、各アクターの効果推論結果
+\code{!\{mut\}} \code{!\{net\}} がチップとして表示される。}
+\label{fig:sim}
+\end{figure}
 
-\section{結論: 学習は Mac、推論はメッシュ}
+図~\ref{fig:sim} が本設計の出発点である。重要なのは右下のパネルで、
+\textbf{効果はソースに書かれたものではなく推論結果}であり、
+実処理系の \code{--type-check} が申告と実体の一致を検査する。
+本設計はこのパネルが示す情報だけから配置・複製・フェイルオーバを導く。
 
-強化学習を 3 つの部分に分けて、それぞれ置き場所を決める。
+シミュレータは 6 軸それぞれに soft-Xinu を 2 台、計 12 個のアクターを走らせている。
+\textbf{実機 6 台は、このうち 6 個を置き換える}という位置づけになる。
+
+\section{6 台をどう割り当てるか}
+
+6 台の割当には 2 通りある。
 
 \begin{center}\small
 \begin{tabularx}{\textwidth}{@{}l l X@{}}
 \toprule
-\textbf{部分} & \textbf{置き場所} & \textbf{理由}\\
+\textbf{案} & \textbf{構成} & \textbf{評価}\\
 \midrule
-方策の実行（推論） & \good{Xinu メッシュ} &
-  TinyML は 192→12→3 で約 2.4k 積和。ボードで十分回る。ロボットの制御経路上に
-  あるので、ここがメッシュの本来の持ち場\\
-方策の更新（学習） & \good{Mac} &
-  Xinu は\prob{D-cache が 3 ボードとも OFF}（アセスメント項目 10、最大の性能
-  レバーが未使用）、ベクトル化も数値ライブラリも無い。12 台 48 コアを足しても
-  素の Mac に勝てる見込みが薄い\\
-経験の収集 & \good{Xinu メッシュ} &
-  各ノードが自分の $(s,a,r)$ を貯める。分散して当然の処理\\
+A & 6 関節 $\times$ 1 台 & アーム全軸が実機 Xinu になる。ただし\prob{冗長性がゼロ}で、
+    当初構想の中核であるフェイルオーバとアクター移動を\textbf{実証できない}\\
+B & \good{3 関節 $\times$ 2 台} & 3 つの独立したリソースで冗長化が成立することを示せる。
+    残る 3 関節は CG 側の soft-Xinu が担う\\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-これは強化学習では標準的な \textbf{actor--learner 分離}（Ape-X / IMPALA と同型）で
-ある。分散したアクターが経験を集め、中央の学習器が方策を更新して配り直す。
-既存資産とも噛み合う --- \textbf{方策の配布には既にある \code{/actor/load}
-(AIPL → C JIT) がそのまま使える}。
+\good{案 B を採る。} 理由は、実証したい主張が「アームが動くこと」ではなく
+「\textbf{Capability に基づく役割分担・冗長化・動的移動が成立すること}」だからである。
+案 A では冗長性が 1 つも無く、リース移譲も昇格も試験できない。
+一方、案 B で足りない 3 関節は CG が肩代わりするので、
+\textbf{アームとしては 6 軸すべてが動く}。ここがシミュレータを持っていることの利点である。
 
-\textbf{追加の Xinu を学習に使わない理由を明確にしておく。} 使えないのではなく、
-現状では割に合わない。D-cache を有効化し (項目 10)、数値カーネルを整備すれば
-状況は変わる。その時点で再評価すべき設計判断であり、恒久的な結論ではない。
+実機に載せる 3 関節は \textbf{ID1（ベース旋回）・ID2（肩）・ID3（肘）} とする。
+この 3 つが搬送時の関節変位の大半を占め、サイクル時間を支配するため、
+実時間性の評価対象として意味がある。ID4--ID6 は CG 側に残す。
 
-\section{アーキテクチャ}
+\begin{center}\small
+\begin{tabular}{@{}l l l l@{}}
+\toprule
+\textbf{ノード} & \textbf{担当} & \textbf{役割} & \textbf{保持する効果}\\
+\midrule
+1 & ID1 & \code{ServoMotor}（主） & \code{!\{act, mut, net\}}\\
+2 & ID1 & \code{ServoSensor}（副） & \code{!\{net\}}\\
+3 & ID2 & \code{ServoMotor}（主） & \code{!\{act, mut, net\}}\\
+4 & ID2 & \code{ServoSensor}（副） & \code{!\{net\}}\\
+5 & ID3 & \code{ServoMotor}（主） & \code{!\{act, mut, net\}}\\
+6 & ID3 & \code{ServoSensor}（副） & \code{!\{net\}}\\
+\bottomrule
+\end{tabular}
+\end{center}
 
-\subsection{4 層構成}
+\textbf{台数効果の測定点は 2 / 4 / 6 の 3 点}になる。1 関節対・2 関節対・3 関節対と
+段階的に増やせば、同じ作業に対するサイクル時間の傾向が取れる。
+1 点では傾向を主張できないので、\textbf{6 台という数は「3 点が取れる最小」}でもある。
+
+\textbf{純粋アクター（\code{Kinematics}）は 6 台すべてに複製する。}
+効果を持たないので二重実行が無害であり、冗長化の費用がゼロだからである
+（第~\ref{sec:rules} 節）。
+
+\section{Capability から配置と冗長化を導く}
+
+\subsection{効果は宣言ではなく推論される}
+
+AIPL の Capability はソースに書くものではない。各メソッド本体の一次作用を
+効果推論が走査して \code{!\{mut, net, ai, fs\}} を導出し、
+\code{--type-check} が申告と実体の食い違いを検出する。
+現在の割当は次のとおり。
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{一次作用} & \textbf{効果} & \textbf{意味}\\
+\midrule
+\code{Arm\_serial\_servo\_write} & \code{mut} & 実機バスサーボの駆動\\
+\code{Arm\_serial\_servo\_read}  & なし & 計測のみ。何も動かさない\\
+\code{tinyml\_infer}            & \code{ai} & ローカル推論。\code{net} を伴わない = 機外へ出ない\\
+\code{tinyml\_load} / \code{write\_file} & \code{fs} & 記憶装置\\
+\code{send} / \code{now} / \code{reply} & \code{net} & メッセージ\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+これは強力である。\code{ServoSensor} は \code{Arm\_serial\_servo\_write} を呼ぶ場所が
+ソース中のどこにも無いため、\good{型によって物理的に駆動できないことが保証される}。
+最小権限が設計意図ではなく検査可能な性質になっている。
+
+\subsection{発見: 効果格子が作用と状態変更を同一視している}
+
+しかし配置の自動導出には足りない。現在のクラスの効果は次のようになる。
+
+\begin{center}\small
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{クラス} & \textbf{効果} & \textbf{外部への作用}\\
+\midrule
+\code{ServoMotor}       & \code{!\{mut, net\}} & \good{あり（サーボを回す）}\\
+\code{ShelfActor}       & \code{!\{mut, net\}} & なし（自分の在庫表を書くだけ）\\
+\code{ConveyorActor}    & \code{!\{mut, net\}} & あり（ストッパを開閉）\\
+\code{ArmMover}         & \code{!\{net\}}      & なし\\
+\code{Kinematics}       & \code{!\{net\}}      & なし（純計算 + \code{reply}）\\
+\code{RecognitionActor} & \code{!\{ai, net\}}  & なし\\
+\code{SafetyActor}      & \code{!\{fs, mut, net\}} & なし\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\prob{\code{ServoMotor} と \code{ShelfActor} は効果集合が同一である。}
+一方は実機を動かし、他方は自分のフィールドを書くだけなのに区別が付かない。
+ソース中のコメント自身が「\code{bind()} の \code{mut} は自分のフィールド \code{id} への
+代入であって、サーボ駆動ではない」と断っており、この曖昧さは認識されている。
+
+配置と複製の規則を効果から導くには、この 2 つを分ける必要がある。
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{提案する効果} & \textbf{意味} & \textbf{導かれる規則}\\
+\midrule
+\code{mut} & 自分の状態を書く & 複製可（各複製が自分の状態を持つ）\\
+\good{\code{act}} & \textbf{外部世界へ作用する} & \prob{同時に 1 つだけ}。配置はその機器に繋がったノードに限定\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\code{Arm\_serial\_servo\_write} と \code{conveyor\_stopper} を \code{act} に移すだけで、
+\code{ServoMotor}/\code{ConveyorActor} と \code{ShelfActor} が型で分かれる。
+\textbf{これは小さな変更だが、以降の設計全体がこの区別の上に載る。}
+
+\subsection{効果集合から決まる規則}\label{sec:rules}
 
 \begin{center}\small
 \begin{tabularx}{\textwidth}{@{}l l l X@{}}
 \toprule
-\textbf{層} & \textbf{周期} & \textbf{実体} & \textbf{役割}\\
+\textbf{効果} & \textbf{配置} & \textbf{複製} & \textbf{根拠}\\
 \midrule
-L0 駆動 & 1--10\,kHz & アーム内蔵 Pi 5 (Linux/ROS) &
-  電流・位置ループ。\code{Arm\_Lib} が I2C でバスサーボを叩く。\textbf{メッシュに
-  載せない}\\
-L1 関節エージェント & 10--100\,Hz & \textbf{Xinu 12 台} &
-  関節ごとに ServoMotor + ServoSensor。目標値の生成と状態推定、TinyML 推論。
-  L0 へは設定値のみ送る\\
-L2 協調 & 10\,Hz & Xinu 1 台 または Mac &
-  タスク列、逆運動学、フェーズ遷移。CG シミュレータの Planner に相当\\
-L3 学習 & 分オーダ & \textbf{Mac} &
-  CEM/RL、データ集約、方策のコンパイルと配布\\
+なし（純粋） & どこでも & \good{自由} & 副作用が無いので二重実行が無害。冗長化の費用がゼロ\\
+\code{!\{net\}} & どこでも & 可（冪等なら） & 重複メッセージを受け手が吸収できる必要\\
+\code{!\{mut\}} & どこでも & 可 & 各複製が独立した状態を持つ\\
+\code{!\{ai\}} & 重みを持つノード & 可 & 推論は決定的。機外へ出ない\\
+\code{!\{fs\}} & 記憶装置を持つノード & 不可 & 書き込みが競合する\\
+\good{\code{!\{act\}}} & \textbf{その機器に繋がったノード} & \prob{不可（厳密に 1 つ）} & 二重駆動は物理的に危険\\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-12 台の割当は、シミュレータが既に採っている
-「各サーボに 2 台 = ServoMotor + ServoSensor」をそのまま実機に写す。
-6 関節 $\times$ 2 = 12 で過不足がない。
+\code{Kinematics} は効果を持たないので\textbf{全ノードに複製してよい}。
+逆運動学を 6 台のどこで解いても同じ答えが出るので、冗長化は無料である。
+一方 \code{ServoMotor} は \code{act} を持つので\textbf{厳密に 1 つ}でなければならない。
 
-\subsection{データ経路}
+\section{冗長化 --- 3 関節 $\times$ 2 台}
+
+\subsection{対の構造}
+
+実機を載せる 3 関節それぞれに 2 台を割り当てる。当初構想どおりだが、
+役割を「モータ役とセンサ役」ではなく\textbf{「\code{act} 保持者と待機者」}として定義する。
 
 \begin{center}\small
-\begin{tabularx}{\textwidth}{@{}l l l X@{}}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
 \toprule
-\textbf{経路} & \textbf{向き} & \textbf{周期} & \textbf{内容}\\
+\textbf{ノード} & \textbf{保持} & \textbf{役割}\\
 \midrule
-設定値 & L2 → L1 → L0 & 10\,Hz & 関節目標角。ノード側で内挿して L0 へ渡す\\
-状態 & L0 → L1 → L2 & 10\,Hz & 実測角、把持状態、カメラ特徴量\\
-経験 & L1 → L3 & 数秒に 1 回 & $(s,a,r)$ の束。欠落しても学習が壊れない粒度\\
-方策 & L3 → L1 & 学習の区切りごと & TinyML の重み。\code{/actor/load} で投入\\
+Xinu-A（主） & \code{ServoMotor}\,\code{!\{act,mut,net\}} & 目標角を受けてサーボを駆動\\
+Xinu-B（副） & \code{ServoSensor}\,\code{!\{net\}} & 同じ関節を計測し、\textbf{主の状態を鏡像として保持}\\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-\textbf{設定値と状態は「最新値の上書き」であって「要求--応答」ではない。}
-14\,\% が失敗する経路の上で信頼性を積み上げるより、落ちたら次の値で上書きされる
-設計にする方が堅い。したがって L1--L2 間は\textbf{HTTP ではなく UDP}
-（MANET の HELLO が既に使っている UDP:5000 と同じ層）とする。
+副が主の状態を常に持っている点が要である。\textbf{昇格時にネットワーク越しの
+状態転送が要らない。} 今日の実測ではメッシュの裾が秒単位あるため、
+「故障を検知してから状態を取りに行く」設計は成立しない。
 
-\section{タイミング予算}
+\subsection{昇格 = Capability の移譲}
 
-10\,Hz (100\,ms) 周期に対する内訳。実測の p99 を使う。
+\code{act} は厳密に 1 つという規則があるので、昇格は\textbf{排他的な移譲}でなければ
+ならない。分断時に主副が同時に駆動する事態は物理的に危険である。
+そこで \code{act} を\textbf{期限付きリース}として扱う。
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
+\item 主は周期 $T_r$ でリースを更新する。
+\item 主が $T_e$ 以内に更新できなければ、\textbf{主は自力で駆動を停止する}
+      （ネットワーク不要。ローカルの時計だけで判定できる）。
+\item 副は $T_e$ 経過を観測してから \code{act} を取得し、昇格する。
+\end{enumerate}
+
+\prob{手順 2 が安全性の要である。} 分断された主が「自分はまだ主だ」と思い込んで
+駆動し続けることを、ネットワークに頼らず防ぐ。これは分散ロックのリースと同じ論法で、
+\textbf{Capability がリソースではなく期限付き権限であることを利用している}。
+
+\subsection{タイミング --- 秒オーダであることを認める}
+
+$T_e$ の下限は実測で決まる。
 
 \begin{center}
 \begin{tabular}{@{}l r l@{}}
 \toprule
-\textbf{項目} & \textbf{時間} & \textbf{根拠}\\
+\textbf{量} & \textbf{値} & \textbf{根拠}\\
 \midrule
-L2 → L1 伝送 & 40\,ms & Pi 5 実測 p99 84\,ms の半分（片道）\\
-L1 推論 (TinyML) & $<$1\,ms & 2.4k 積和\\
-L1 → L0 伝送 & 未測定 & アーム内蔵 Pi との接続方式が未確定\\
-L0 サーボ応答 & 未測定 & \prob{カタログに速度の記載が無い}\\
-余裕 & --- & 残り\\
+HELLO 周期 & 2\,s & \code{device/wifi/wifi.c}（現行実装）\\
+往復レイテンシ p99 & 84--3009\,ms & 本日実測（Pi 5 / Pi 3）\\
+リース更新 $T_r$ & $\ge$1\,s & p99 の裾を吸収する\\
+リース期限 $T_e$ & $\ge$3\,s & $T_r$ の 3 倍。誤検知を避ける\\
+\midrule
+\prob{フェイルオーバ所要} & \prob{3--5\,s} & 上記の合計\\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\prob{下 2 行が空欄であることが、現時点の設計の最大の弱点である。}
-実機が来るまで埋まらない。したがって当面は\textbf{この 2 つをパラメータとして
-残し、感度解析で扱う}。カタログに無い数字を「あることにする」よりも、
-結論がその数字にどう依存するかを示す方が、実機が来たときに測って差し替えるだけで
-済む。
+\prob{したがってこの冗長化は「可用性」のためであって「無停止」のためではない。}
+3--5 秒のあいだ、その関節には駆動権限を持つ者がいない。
+\textbf{その間アームが安全であることは、メッシュではなく L0（アーム内蔵 Pi）が
+保証しなければならない} --- 最後の目標角を保持するか、停止する。
+これは選択肢ではなく要件である。
 
-\section{段階的な導入}
+\section{アクターの動的移動}
 
-実機は順次購入して繋いでいく前提なので、台数ごとに何が成立するかを定める。
+\subsection{既にあるもの・無いもの}
 
 \begin{center}\small
 \begin{tabularx}{\textwidth}{@{}l l X@{}}
 \toprule
-\textbf{段階} & \textbf{台数} & \textbf{成立すること}\\
+\textbf{要素} & \textbf{状態} & \textbf{備考}\\
 \midrule
-現在 & 3 & メッシュ疎通、レイテンシ実測、アクター実行。\textbf{制御は不可}\\
-第 1 & 3 & CG シミュレータを実機メッシュに接続。ServoMotor 6 個を 3 台に分散し、
-           CG が実機の出す指令で動く。\textbf{ここで初めて「Xinu が関節を動かす」}\\
-第 2 & 6 & ServoMotor 6 個を 6 台に 1:1 割当。関節ごとの独立性が出る\\
-第 3 & 12 & ServoSensor 6 個を追加。設計どおりの 12 ノード構成\\
-第 4 & 12 + 実機 & L0 をアーム内蔵 Pi に接続。CG と実機の二重化\\
+コード移動 & \good{実装済} & \code{/actor/load}（AIPL → C JIT）が Pi 4 / Pi 5 にある\\
+効果推論 & \good{実装済} & \code{--type-check} で申告と実体を照合\\
+\code{act} の分離 & \prob{未} & 第 2.2 節の提案\\
+状態の直列化 & \prob{未} & 移動にはアクターのフィールドを運ぶ必要がある\\
+リース機構 & \prob{未} & \code{act} の排他移譲\\
+配置決定器 & \prob{未} & 効果 + 容量から配置を解く\\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-\textbf{第 1 段階は今の 3 台で実施できる}。CG シミュレータ (\code{:8022}) が
-実機ノードの \code{/actor/send} を叩き、返ってきた関節角で描画する形にすれば、
-新しいハードウェアなしに「実機 Xinu が CG のアームを動かす」ところまで行ける。
-そこで取れるサイクル時間とジッタが、12 台に増やす価値を判断する実数になる。
+\textbf{コード移動が既にあることは大きい。} 移動の難所は通常コード配布であり、
+そこは AIPL → C JIT と \code{/actor/load} で解決済みである。
+
+\subsection{移動の契機と手順}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+\textbf{契機} & \textbf{手順}\\
+\midrule
+ノード故障 & リース期限切れ → 副が昇格（第 3.2 節）\\
+負荷偏り & 純粋アクターを空きノードへ複製し、要求を分散。\textbf{状態が無いので停止不要}\\
+RT 締切超過 & 期限に間に合っていないアクターを、余裕のあるノードへ移す\\
+熱・電源 & 同上\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\textbf{効果集合が移動の難易度をそのまま決める。}
+純粋アクターは複製するだけでよく、停止も同期も要らない。
+\code{mut} を持つものは状態を運ぶ必要がある。
+\code{act} を持つものはリース移譲を伴い、最も高くつく。
+\textbf{したがって移動の計画は、効果の軽いものから順に動かす}のが合理的である。
+
+\section{リアルタイム性}
+
+「全体として効率の良いリアルタイム OS」にするために、
+どのアクターが実時間制約を持つかを明確にする。
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}l l l X@{}}
+\toprule
+\textbf{アクター} & \textbf{周期} & \textbf{締切} & \textbf{置き場所}\\
+\midrule
+\code{ServoMotor} & 10\,Hz & 硬 & \textbf{RT スケジューラを持つノード}\\
+\code{ServoSensor} & 10\,Hz & 軟 & 同上（対の相方）\\
+\code{ArmMover} & 10\,Hz & 軟 & 任意\\
+\code{Kinematics} & 要求時 & 軟 & 任意（複製可）\\
+\code{RecognitionActor} & 撮像時 & 軟 & 重みを持つノード\\
+\code{SafetyActor} & 事象時 & \good{硬} & 記憶装置を持つノード\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+硬い締切を持つのは \code{ServoMotor} と \code{SafetyActor} だけである。
+\textbf{Pi 4 のプリエンプティブ優先度スケジューラ（実測 max jitter 10\,$\mu$s、
+100 回中ミス 0）はこの用途に十分な性能を持つ。}
+残りは軟らかいので配置の自由度が高く、移動の対象にしやすい。
+
+\prob{ただし現状 RT スケジューラは Pi 4 のみで実用段階にある。}
+Pi 5 は移植の途中（Stage 1--2）、Pi 3 は upstream の
+スケジューラである。6 台構成では\textbf{どのノードが硬い締切を引き受けられるかが
+不均一}であり、配置決定器はこれを制約として扱う必要がある。
+
+\section{学習の位置づけ}
+
+学習も「効果を持つアクターの 1 つ」として同じ枠組みで扱う。
+\code{Learner} は \code{!\{ai, net\}}（重みを読むなら \code{fs} も）であり、
+配置規則は第 2.3 節の表がそのまま適用される --- 重みを持つノードならどこでもよく、
+複製も可能である。
+
+\textbf{現時点の推奨は Mac に置くことだが、これは設計ではなく性能の問題である。}
+Xinu は 3 ボードとも \prob{D-cache が OFF}（アセスメント項目 10、
+最大の性能レバーが未使用）で、ベクトル化も数値ライブラリも無い。
+6 台 24 コアを足しても素の Mac に勝てる見込みが薄い。
+\textbf{D-cache を有効化した時点で再評価すべきであり、
+そのときは配置決定器に \code{Learner} を渡すだけで済む} ---
+枠組みを変える必要は無い。ここが本設計の利点である。
+
+推論（\code{RecognitionActor}、TinyML 192→12→3 = 約 2.4k 積和）は
+最初からメッシュ側に置く。ロボットの制御経路上にあり、計算量も小さい。
+
+\section{実装の順序}
+
+依存関係の順に並べる。各段は前段が無いと意味を持たない。
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}c X l@{}}
+\toprule
+\textbf{段} & \textbf{内容} & \textbf{検証}\\
+\midrule
+1 & \code{act} 効果の分離（\code{Arm\_serial\_servo\_write} を \code{mut} から移す） &
+    \code{--type-check} で \code{ServoMotor} と \code{ShelfActor} が分かれる\\
+2 & 配置規則の実装（効果集合 → 配置可能ノード集合） & 単体テスト\\
+3 & 状態の直列化（アクターのフィールドを運ぶ） & 移動前後で状態が一致\\
+4 & リース機構（\code{act} の排他移譲） & 分断注入で二重駆動が起きないこと\\
+5 & CG を実機メッシュに接続（現在の 3 台で可能） & \textbf{実機 Xinu が CG の関節を動かす}\\
+6 & 配置決定器（効果 + 容量 + RT 能力） & 故障注入で自動再配置\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\textbf{第 1 段は今日から着手でき、費用がほぼゼロで効果が大きい。}
+型検査だけで検証できる（実機不要）。第 5 段は現在の 3 台で実施でき、
+そこで取れるサイクル時間とジッタが、さらに台数を増やす価値を判断する実数になる。
 
 \section{着手前に潰すべき前提}
 
-設計そのものより先に、次が片付いていないと数字が信用できない。
-
 \begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
-\item \prob{Pi 3 の 14\,\% 失敗}。原因は特定済み（単一 accept の HTTP サーバ）、
-      修正はコミット済み・未デプロイ。\textbf{デプロイして効果を実測する}。
+\item \prob{Pi 3 の 14\,\% 失敗}。原因特定済（単一 accept の HTTP サーバ）、
+      修正はコミット済み。デプロイして効果を実測する。
 \item \prob{Pi 4 の 130\,ms}。有線で Pi 5 の 3.6 倍。原因未究明。
-      メッシュ全体の応答を律速している。
-\item \prob{時刻同期が無い}。各ノードが自分の時計を見ているだけで、
-      ノード間の共通時刻がない。経験 $(s,a,r)$ をノード横断で突き合わせるには必須。
-      Pi 3 は時間軸自体が壊れていた（本日修正、\code{clkticks} は秒内カウンタで
-      非単調、かつ 100\,Hz 前提で 10 倍ずれ）。
-\item \prob{D-cache が 3 ボードとも OFF}。学習をメッシュに載せるか否かの
-      判断は、これを有効化してから再評価する。
-\item \prob{サーボ速度がカタログに無い}。RL の結論が依存する。
-      感度解析で扱い、実機で測って差し替える。
+\item \prob{時刻同期が無い}。リースの期限判定はローカル時計で足りるが、
+      経験 $(s,a,r)$ をノード横断で突き合わせるには共通時刻が要る。
+\item \prob{D-cache が 3 ボードとも OFF}。学習の配置判断はこれを直してから。
+\item \prob{RT スケジューラが Pi 4 のみ}。6 台の能力が不均一。ただし異種混成は
+      「能力の異なるノード群への配置問題」として\textbf{研究上の資産でもある}。
 \end{enumerate}
 
 \section{本書の限界}
 
 \begin{itemize}[leftmargin=1.6em,itemsep=2pt]
-\item レイテンシは 200 サンプル $\times$ 3 台、1 回の測定である。時間帯や
-      電波状況による変動は評価していない。
-\item L1--L0 間とサーボ応答は\textbf{未測定}であり、タイミング予算に空欄がある。
-\item 12 台構成の効果（4--6 倍）は\textbf{外挿}であり、実測は 3 台 1.87 倍のみ。
+\item レイテンシは 200 サンプル $\times$ 3 台、1 回の測定である。
+\item リースの $T_r$ / $T_e$ は実測レイテンシからの\textbf{見積もり}であり、
+      分断注入試験で検証していない。
+\item \code{act} 分離の提案は\textbf{未実装}。型検査を通していない。
+\item 台数効果は\textbf{外挿}であり、実測は 3 台 1.87 倍（効率 62\,\%）のみ。
 \item アーム内蔵 Pi 5 に ROS が載っているという前提は\textbf{未確認}。
-      製品構成からの推定であり、実機が来るまで検証できない。
 \end{itemize}
 
 \vfill
 {\small\itshape 実測は Raspberry Pi 3 B+ / 4 / 5 上の Xinu、
 MANET は WiFi ad-hoc (IBSS)、SSID \code{MANET}、ch 6、\code{10.0.0.2/3/5}。
-CG シミュレータは \code{\textasciitilde/aipl\_line\_simulator}（:8022）。}
+アクター定義は \code{\textasciitilde/aipl\_line\_simulator/aipl/dofbot\_xinu.abcl}。}
 
 \end{document}
