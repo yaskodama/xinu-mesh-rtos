@@ -1,0 +1,1369 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[a4paper,margin=22mm]{geometry}
+\usepackage{xeCJK}
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\setCJKmainfont{Hiragino Mincho ProN}
+\setCJKsansfont{Hiragino Sans}
+\setCJKmonofont{Hiragino Sans}
+\setmonofont{Menlo}[Scale=0.82]
+
+\xeCJKDeclareCharClass{CJK}{"2460 -> "24FF, "2013 -> "2015, "2018 -> "201F, "2026, "2500}
+
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue!60!black,
+  pdftitle={LLM 駆動フィジカル AI のリアルタイム性 —— 文献レビューと研究計画},
+  pdfauthor={児玉靖司}}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\prob}[1]{\textbf{\textcolor{red!55!black}{#1}}}
+\newcommand{\keyp}[1]{\textbf{\textcolor{blue!45!black}{#1}}}
+
+\title{\vspace{-12mm}
+  \Large LLM 駆動フィジカル AI のリアルタイム性\\[2mm]
+  \large 主要論文5本の整理、Xinu メッシュ RTOS への含意、および研究計画\\[1mm]}
+\author{\normalsize 児玉靖司}
+\date{\normalsize 2026年8月12日}
+
+\begin{document}
+\maketitle
+\vspace{-6mm}
+
+\begin{abstract}
+\noindent
+基盤モデル（VLA: Vision-Language-Action）でロボットを動かそうとすると、
+\prob{推論が遅すぎて制御周期に間に合わない}という一点に問題が集約される。
+本稿は、この遅延をどう扱うかについて異なる立場をとる論文5本を読み、
+その解法を「遅延を隠す／遅延に合わせて整合させる／遅延をスケジュールする／
+遅延の外側で安全を保証する」の4系統に整理する。
+最後に、\code{xinu-mesh-rtos}（AIPL 駆動の12ノード Xinu メッシュを
+アーム型ロボット向け RTOS にする計画）の実測値と突き合わせ、
+どこが既に足りていて、どこが未着手かを述べる。
+そのうえで、我々の RTOS を論文にするための\keyp{4つの設計案}（うち1つは6ノードで済む最小構成）と、
+機械学習をどの計算機で実装するかの構成、および各案の研究予算を示す。
+本稿は3部からなる。第\ref{part:review}部で文献を整理し、第\ref{part:design}部で4つの設計案と予算を示し、第\ref{part:plan}部で推奨案（案D、2年・220万円）を独立した研究計画として詳述する。
+\end{abstract}
+
+\vspace{-2mm}
+{\small\tableofcontents}
+\clearpage
+
+\part{文献レビュー ── LLM 駆動フィジカル AI のリアルタイム性}
+\label{part:review}
+
+\section{なぜこの5本か}
+
+2026年現在、LLM をロボットに使う研究の主流は、言語モデルに動作計画を出させる初期の形から、
+視覚・言語・動作を一体で学習する \keyp{VLA 基盤モデル}へ移っている。
+そこで工学的な中心課題になっているのが\prob{推論遅延}である。
+
+数字で押さえておく。実機のサーボ更新は 50--120\,Hz、
+すなわち1周期あたり 8--20\,ms しかない。
+一方、80億パラメータ級の VLA を機上の Jetson Orin で素直に動かすと
+1推論に \prob{400\,ms 超}かかり、制御周波数は 1\,Hz を割る。
+\keyp{2桁の開き}があり、これは実装の巧拙では埋まらない。
+本稿で扱う5本は、この開きに対する立場がそれぞれ異なる（表\ref{tab:pos}）。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{5本の立ち位置}
+\label{tab:pos}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{論文} & \textbf{時期} & \textbf{遅延への立場} \\
+\midrule
+AsyncVLA   & 2026-02 & \textbf{隠す}。重い推論を遠隔に置き、エッジ側の小さな方策が高頻度で動き続ける \\
+Jetson-PI  & 2026-07 & \textbf{整合させる}（機上完結）。推論完了時点の環境を先読みして予測を補正 \\
+VLASH      & 2025-12 & \textbf{整合させる}（学習で）。実行時刻の状態に条件づけるよう学習し直す \\
+TimelyLLM  & 2024-12 & \textbf{スケジュールする}。生成を分割し、時間効用でサーバ側を並べ替える \\
+Safe LLM   & 2025-03 & \textbf{外側で保証する}。到達可能性解析で LLM の出力を検証してから実行 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent
+\textbf{読み方の断り。} 本稿は各論文の本文（arXiv の HTML 版）から抽出した記述に基づく。
+PDF 本体を精読したわけではなく、数値は各論文が\emph{自己申告}したものである。
+特に第\ref{sec:jetsonpi}節の VLASH との比較は Jetson-PI 側の主張であり、
+競合手法の評価としてそのまま受け取るべきではない。
+
+\section{AsyncVLA —— 遠隔の大モデルとエッジの小方策を非同期に繋ぐ}
+
+\noindent
+Hirose, Glossop, Shah, Levine.\ \emph{AsyncVLA: An Asynchronous VLA for Fast and Robust
+Navigation on the Edge}.\ arXiv:2602.13476, 2026年2月.
+
+\subsection*{構成}
+
+意味的な推論と反射的な実行を\keyp{切り離す}。
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{遠隔側}：OmniVLA（82.6億パラメータ）を RTX 4090 のワークステーションで走らせる。
+        最大 5\,Hz。出力は最終層の動作特徴を $4\times4096$ から 1024 次元へ圧縮した
+        \emph{動作トークン埋め込み}であって、動作そのものではない。
+  \item \textbf{エッジ側}：ロボット上の Jetson Orin（30\,W）で 7600万パラメータの
+        ViT ベース方策を 8\,Hz で回す。遠隔から来た埋め込み、現在の一人称画像（$96\times96$）、
+        そして\emph{古い}観測 $I_{t-k}$ の3つを食べて、8ステップ（3\,Hz 制御で2.4秒ぶん）の
+        動作チャンクを出す。
+\end{itemize}
+
+\subsection*{肝は「古い入力で学習させる」こと}
+
+素直に作れば、遠隔から届く意味情報は必ず古い。
+本手法は学習時に\keyp{わざと観測をずらす}。すなわち
+「VLA 側の観測は長い文脈からランダムに選び、エッジ側は常に最新の観測を見る」。
+これによりエッジ方策は、古い意味特徴を受け取りながら\emph{現在}の状態に対する動作を
+出すよう強制される。
+
+さらに\keyp{軌道の重み付け}を行う。現在参照の動作チャンク $A_t$ と
+遅延参照の $A_{t-k}$ の最終姿勢が閾値以上離れる標本を重く扱う。
+これは衝突回避や歩行者への譲りといった\emph{反射的にふるまうべき}場面を選び出す操作にあたる。
+
+\subsection*{結果}
+
+Vizbot 実機、WiFi の実測遅延 0.28--6.0 秒という条件で、動的環境（歩行者あり）の
+位置指定ナビゲーションを評価している（表\ref{tab:async}）。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{AsyncVLA の実機結果（位置指定ナビゲーション）}
+\label{tab:async}
+\begin{tabular}{@{}l r r r r@{}}
+\toprule
+\textbf{手法} & \textbf{成功率} & \textbf{到達時間(s)} & \textbf{静的衝突} & \textbf{動的衝突} \\
+\midrule
+OmniVLA-edge（1.08億・機上のみ・6\,Hz） & 25\,\% & 80.07 & 1.00 & 0.50 \\
+OmniVLA（82.6億・遠隔・5\,Hz）          & 45\,\% & 70.73 & 0.30 & 1.05 \\
+提案手法から E2E 微調整を除いたもの      & 25\,\% & 82.78 & 0.60 & 1.05 \\
+\textbf{AsyncVLA} & \textbf{85\,\%} & \textbf{59.18} & \textbf{0.10} & \textbf{0.10} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+45\,\%$\to$85\,\%、すなわち\keyp{40 ポイント}の改善である
+（論文の要旨は「40\,\% higher」と書くが、表を見るかぎり40\emph{ポイント}が正確）。
+人為的に 0.2--5.0 秒の遅延を課しても成功率 50\,\% を保ち、
+同条件の OmniVLA は 0.2\,Hz で 0\,\% まで落ちる。
+
+\keyp{示唆}。大きいモデルを機上に載せる必要はない。ただし\prob{エッジ側の方策は
+「古い情報が来る」前提で学習されていなければならない}。これは通信や OS の工夫では
+埋められない、学習側の要件である。
+
+\section{Jetson-PI —— 機上で完結させ、未来を先読みして整合させる}
+\label{sec:jetsonpi}
+
+\noindent
+\emph{Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned
+Asynchronous Inference}.\ arXiv:2607.12659, 2026年7月.
+
+\subsection*{問題の切り分け}
+
+機上 VLA には2つの別々の問題があるとする。
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item \prob{知覚と実行のずれ}：Jetson Orin では推論に約1.4秒かかり、
+        その間に環境が変わる。予測された動作は\emph{古い状態}に向いている。
+  \item \prob{反応時間}：非同期化しても、応答は推論遅延 $\Delta$ から $\Delta+L$
+        （$L$ はチャンク長）ステップの間に律速される。
+\end{enumerate}
+
+\subsection*{手法}
+
+VLM の最終層表現の\keyp{$t+\Delta$ 時点の値を予測する}小さな補正モジュール
+（4000万パラメータ、全体の1\,\%）を置く。画像や層ごとの KV キャッシュではなく、
+圧縮済みの最終層出力だけを使う。出力は2つで、未来の環境表現と\emph{確信度}である。
+
+この確信度で\keyp{VLM を呼ぶかどうかを切り替える}。確信度が閾値を超えていれば
+VLM を飛ばし、動作エキスパートだけを回す。下回れば VLM に現環境を見せて文脈を更新する。
+根拠として、機上デバイスでは VLM も動作エキスパートも\emph{帯域律速}になるため、
+ハイエンド GPU と違って並列化が逆効果になる、というルーフライン解析を挙げている。
+実装面では CUDA グラフの再利用、GPU 常駐バッファ、フローマッチングの展開融合を併用する。
+
+\subsection*{結果}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item Jetson Orin での制御周波数：素の PyTorch 0.70\,Hz $\to$ \keyp{6.06\,Hz}（8.66倍）。
+        Jetson Thor では 7.59\,Hz。
+  \item 内訳（Orin、$\pi_{0.5}$）：ViT 79.5\,ms ＋ LLM 210.3\,ms ＋ 動作エキスパート 123.1\,ms
+        ＝ 合計 \prob{412.9\,ms}。反応時間 165.1\,ms。
+  \item 実機（布たたみ）：たたみ 8/10 成功。同じ Orin 上の素朴な非同期実装は 0/10。
+\end{itemize}
+
+なお 6.06\,Hz は、確信度による VLM 省略を含めた\emph{制御}周波数であり、
+VLM を毎回呼ぶ場合の1推論は上記の 412.9\,ms を要する。
+
+内訳の 412.9\,ms は本稿でもっとも重要な数字である。
+\keyp{最適化を尽くしても、機上の VLA は 1 周期あたり数百 ms を要する}。
+
+\section{VLASH —— 実行時刻の状態に条件づけ直す}
+
+\noindent
+\emph{VLASH: Real-Time VLAs via Future-State-Aware Asynchronous Inference}.\
+arXiv:2512.01031, 2025年12月.
+
+同じ「ずれ」に、\keyp{学習だけで}対処する。追加モジュールもアーキテクチャ変更もない。
+
+着想は単純である。新しいチャンクが用意できるまで、ロボットは前のチャンクの残りを実行する。
+その動作は\emph{既知}なのだから、それに沿って状態を前送りすれば実行時刻の状態を推定できる。
+そこでモデルを、現在状態ではなく\keyp{推定した実行時刻の状態}に条件づける。
+
+学習は時間オフセット拡張で行う。視覚観測は固定したまま状態だけ時間的にずらした
+組を与え、モデルが視覚特徴に過適合せず\emph{状態}を見るよう仕向ける。
+複数オフセットを観測共有で1系列に詰める実装により学習が3.26倍速い。
+
+結果は、同期推論比で反応遅延が最大 11.8 倍短縮、動作量子化と併せてタスク完了が 1.5--2.0 倍速。
+卓球（命中率55\,\%）やもぐら叩きのような\emph{動的}タスクが成立する。
+$\pi_{0.5}$、GR00T N1.6、SmolVLA にそのまま適用できる。
+
+\keyp{Jetson-PI との関係}。両者は同じ問題を、
+\emph{追加モジュールで補正する}（Jetson-PI）か\emph{学習で吸収する}（VLASH）かで分かれる。
+Jetson-PI は LIBERO で VLASH に平均 14.8 ポイント勝ち、遅延 $\Delta=9$ で
+VLASH が 30.1\,\% に落ちるのに対し 97.0\,\% を保つと報告する。
+ただしこれは\prob{Jetson-PI 側による競合手法の評価}である。
+
+\section{TimelyLLM —— 生成を分割し、時間効用で並べ替える}
+
+\noindent
+Ling, Chen, Zhong.\ \emph{TimelyLLM: Segmented LLM Serving System for
+Time-sensitive Robotic Applications}.\ arXiv:2412.18695, 2024年12月.
+
+唯一の\keyp{OS／システムソフトウェア側}の論文であり、本計画にもっとも直接効く。
+
+\subsection*{問題}
+
+既存の LLM サービング系は先着順（FCFS）のバッチ処理をとる。
+これはロボットの時間制約と噛み合わない。
+ロボットは\emph{計画の生成}と\emph{その実行}を交互に行うが、
+FCFS では応答が全部揃うまで実行を開始できない。
+
+\subsection*{分割生成}
+
+生成を最後まで待たず、\keyp{実行可能な単位}が出た時点で切り出す。
+生成中に逐次デトークナイズし、\code{pick(cyan\_box)} のような実行可能文が完成したら
+そこで生成を中断してロボットへ投げる。
+再開のために KV キャッシュとトークン列を保持する。
+この\keyp{文脈切り替えのコストは約 9.5\,ms}で、典型的な生成時間 370\,ms の 3\,\% 未満である。
+
+ロボットが投げた区間を実行している間に次の区間を生成できるため、
+生成と実行が重なる。
+
+\subsection*{時間効用によるスケジューリング}
+
+各要求に時間効用関数 $\mathrm{TUF}(t)=\min\bigl(\beta,\ \alpha(t-\mathrm{ERT})+\beta\bigr)$
+を与える。通常タスクは $\mathrm{ERT}=1$\,s、$\alpha=-2$、
+緊急タスクは $\mathrm{ERT}=200$\,ms、$\alpha=-6.67$ とする。
+スケジューラは\keyp{潜在効用密度}（単位時間あたり効用）を貪欲に最大化し、
+ロボットの実行所要時間の見積りを取り込んで、
+\emph{現在の実行が終わる前に}次の区間の生成が始まるよう並べる。
+
+\subsection*{結果}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item 評価対象：DJI Tello ドローン（11タスク）、Neuromeka Indy7 Pro アーム
+        （積み上げ・机の片づけ・分類）、チャットボット。
+        RTX 4090 ＋ Ryzen 9 7950x、Llama3-8B（fp16）。
+  \item アーム（机の片づけ）：時間効用 最大 \keyp{1.97倍}、
+        ロボットの待ち時間 \keyp{84\,\% 削減}。
+  \item スケジューラ単体：緊急タスクの効用が FCFS 比 183\,\%、EDF 比 142\,\%。
+  \item 分割生成のオーバヘッドは 6\,\% 未満、スケジューリングは待ち8件で 2.03\,ms。
+\end{itemize}
+
+\keyp{示唆}。EDF に 142\,\% の差をつけている点が重要である。
+\prob{締切だけを見る古典的スケジューリングでは足りない}。
+LLM の応答は「遅れると価値が連続的に落ちる」性質を持ち、
+その形（$\alpha$、ERT）をスケジューラに教える必要がある。
+
+\section{Safe LLM-Controlled Robots —— 実行前に到達可能集合で検証する}
+
+\noindent
+\emph{Safe LLM-Controlled Robots with Formal Guarantees via Reachability Analysis}.\
+arXiv:2503.03911, 2025年3月.
+
+LLM は零ショットで人と対話できるが、\prob{形式的な安全保証を持たない}。
+本手法は解析モデルに頼らず、\keyp{運用データから}ロボット＋LLM 系の
+到達可能集合を構成する。LLM が出した低レベル制御指令について、
+起こりうる軌道すべてが安全領域に留まるかを実行前に検証する。
+自律ナビゲーションとタスク計画の事例で有効性を示している。
+
+これは前4本と層が違う。前4本が\emph{速さ}の話であるのに対し、
+本論文は\emph{速さを諦めてよい層}に安全論証を置く。
+
+\section{整理}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{4系統の対比}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{系統} & \textbf{代表} & \textbf{要点と代償} \\
+\midrule
+遅延を隠す & AsyncVLA
+  & 大モデルは遠隔でよい。代償：エッジ方策を「古い入力」で学習し直す必要。
+    通信断への備えも要る \\
+遅延に整合させる & Jetson-PI / VLASH
+  & 機上完結できる。代償：それでも数 Hz。Jetson-PI は追加モジュール、
+    VLASH は再学習が要る \\
+遅延をスケジュールする & TimelyLLM
+  & 生成と実行を重ねる。代償：分割点を「実行可能単位」で切れる出力形式が前提 \\
+外側で保証する & Safe LLM
+  & 形式保証が得られる。代償：検証のぶん遅くなる。速い層には置けない \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+共通しているのは、\keyp{単一の周期に統合しようとしていない}ことである。
+5本とも、速い層と遅い層を分け、その間を\emph{古い情報でも動く}ように設計している。
+
+\section{\code{xinu-mesh-rtos} への含意}
+\label{sec:impl}
+
+\subsection*{既に足りているもの}
+
+本計画では rpi5 について、preempt=1 で 1\,kHz 周期タスクの
+\keyp{最大ジッタ 3\,\textmu s、200周期中の締切超過 0}を実測している
+（rpi4 は 228\,\textmu s、rpi3 は 57\,\textmu s）。
+
+これを分野の要求と並べる（表\ref{tab:gap}）。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{要求周期と実測値の対比}
+\label{tab:gap}
+\begin{tabular}{@{}l r r@{}}
+\toprule
+\textbf{層} & \textbf{周期} & \textbf{1周期の予算} \\
+\midrule
+System 1（サーボ指令）& 120\,Hz & 8.3\,ms \\
+両腕系のループ全体     & 50\,Hz  & 20\,ms \\
+System 2（VLM 文脈）  & 5--10\,Hz & 100--200\,ms \\
+機上 VLA の1推論（Jetson-PI, $\pi_{0.5}$, Orin）& --- & 412.9\,ms \\
+同・最適化と VLM 省略を入れた制御周波数 & 6.06\,Hz & --- \\
+\midrule
+\textbf{本計画の実測（rpi5, 1\,kHz）} & \textbf{1000\,Hz} & \textbf{ジッタ 3\,\textmu s} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\keyp{System 1 の時間予算は、Xinu メッシュなら3桁の余裕がある}。
+8.3\,ms に対してジッタ 3\,\textmu s である。
+つまり本計画がこれまで積み上げてきた RT 化（優先度付き ready\_pop、
+tickless ワンショットタイマ、ネットスタックの ISR からの追い出し）は、
+\emph{分野が必要としている速い層の要件を既に満たしている}。
+
+\subsection*{未着手なもの}
+
+不足しているのは速さではなく、\prob{遅い層との繋ぎ方}である。具体的には3点。
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
+  \item \prob{System 2 をどこで走らせるか}。412.9\,ms を要する推論を12ノードのどこに置くか、
+        あるいは AsyncVLA のように外部に置くかは未決である。
+        Xinu ノードに載る規模ではない以上、
+        \keyp{メッシュの外に置いて非同期に受ける}のが現実的だと思われる。
+  \item \prob{古い文脈を配る仕組み}。5--10\,Hz で届く意味トークンを、
+        1\,kHz で回る12ノードへどう配布し、
+        各ノードが\emph{どれだけ古い情報を持っているか}をどう表現するか。
+        AIPL のアクター・メッセージングはこのチャネルの実装として素直だが、
+        現状の実装は\prob{アクターのメールボックスが溢れると落とす}
+        （\code{cc.c:532}）。古い意味トークンを落とすのは正しい挙動でありうるが、
+        \emph{意図してそうしている}状態にはなっていない。
+  \item \prob{時間効用の考え方}。TimelyLLM が EDF に 142\,\% の差をつけた事実は、
+        本計画のスケジューラ設計に直接効く。
+        速い層は締切で正しいが、\keyp{遅い層は締切ではなく効用で並べるべき}である。
+        現在の優先度固定スケジューリングには、この二層構造がない。
+\end{enumerate}
+
+\subsection*{さらに、学習側の要件が OS 設計を縛る}
+
+AsyncVLA のもっとも重い含意は性能値ではない。
+\prob{エッジ側の方策は「古い意味情報が来る」前提で学習されていなければ、
+どれだけ OS を速くしても成立しない}という点である。
+逆に言えば、本計画が提供すべきは\emph{遅延ゼロ}ではなく、
+\keyp{遅延が有界であること、そしてその値が上位に見えること}である。
+「いま持っている文脈は何ms前のものか」をノードが答えられる設計にしておけば、
+上位の学習側はそれを条件として扱える。
+これは RTOS 側が出せる保証として自然であり、いまの実装には無い。
+
+\section{読み残し}
+
+本稿は arXiv の HTML 版から抽出した記述に基づく整理であり、
+以下は未確認である。
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item AsyncVLA の所属機関、および言語指定ナビゲーションの詳細な条件。
+  \item Jetson-PI の VLASH 比較（LIBERO）の再現条件。競合手法の評価は
+        提案側の報告のみで判断すべきでない。
+  \item Safe LLM 論文の検証にかかる計算コスト。実時間制御の内側に置けるかは不明。
+  \item いずれの論文も\emph{分散}構成（複数ノードで1台のロボットを制御）は扱っていない。
+        12ノード構成に固有の課題は、この5本の外にある。
+\end{itemize}
+
+\part{研究構想 ── 4つの設計案と予算}
+\label{part:design}
+
+\section{論文化に向けた4つの設計案}
+
+第\ref{sec:impl}節で述べたとおり、速い層は既に足りている。
+新規性を出すべきなのは\keyp{OS 側で何を保証するか}であって、
+モデルを速くすることではない。既読5本との差分は次の3点に集約される。
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item いずれも\prob{分散構成を扱っていない}。1台の計算機（あるいは遠隔1台＋機上1台）が前提。
+  \item 遅延への対処が\prob{学習側に寄っている}。OS が何を保証するかは書かれていない。
+  \item 機上推論の\prob{WCET（最悪実行時間）を論じていない}。平均の Hz は出すが上界は出さない。
+\end{itemize}
+
+以下の案A--Cはこの3点にそれぞれ対応し、案Dは3点すべてを最小構成で同時に狙う。
+
+\subsection{案A：鮮度を第一級の OS 抽象にする}
+
+\subsubsection*{主張}
+
+\keyp{「この文脈は何 µs 前のものか」を、OS が保証し、かつ上位に見せる。}
+
+AsyncVLA はエッジ方策を「古い情報が来る」前提で\emph{学習}して解いた。
+本案は同じ問題を\emph{OS の契約}として解く。
+各アクター・メッセージに生成時刻を持たせ、配送時に実測経過時間を添える。
+さらに経路ごとの\keyp{鮮度上界 $D$}を静的に与え、$D$ を超えた文脈は
+配送せずに破棄する（現状の \code{cc.c:532} の暗黙の取りこぼしを、
+明示的な鮮度契約に置き換える）。
+
+\subsubsection*{実装項目}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item AIPL のメッセージ型に鮮度上界を付与し、アクター合成の経路について
+        $D$ を\keyp{静的に}積み上げる型検査（\code{rtos\_plan} の課題⑩の具体化）。
+  \item 実行時 API \code{ctx\_age\_us()}：いま保持している文脈の実測齢を返す。
+  \item メールボックス方針の明示化：文脈クラスは\emph{最新優先で上書き}、
+        指令クラスは\emph{取りこぼし禁止}。クラスごとに別方針を持たせる。
+  \item 12ノードでの端点間鮮度の実測。\keyp{平均ではなく分布}で示す
+        （上界の主張は最悪値でしか支えられない）。
+\end{enumerate}
+
+\subsubsection*{評価と主張できること}
+
+静的上界 $D$ と実測最大値の\keyp{乖離（tightness）}が主要指標になる。
+加えて、同一方策に対して鮮度を条件として与えた場合と与えない場合で
+制御性能を比較すれば、「OS が鮮度を見せることの効用」を定量化できる。
+これは既読5本のどれも測っていない量である。
+
+\subsubsection*{規模とリスク}
+
+最小構成なら3ノードで論文になる。実装は既存カーネルの延長で、
+新規ハードウェアをほぼ必要としない。\prob{弱点は上位の学習側}で、
+鮮度条件つき方策を自前で用意できないと「見せた効用」を示せない。
+簡易な模倣学習方策で代替する退路を用意しておく。
+
+\subsubsection*{投稿先}
+
+RTSS / RTAS、あるいは ACM TECS。言語側を前面に出すなら EMSOFT。
+
+\subsection{案B：ハード締切と時間効用を単一カーネルで共存させる}
+
+\subsubsection*{主張}
+
+\keyp{1\,kHz の関節制御（締切で正しい層）と、5--10\,Hz の文脈配布
+（効用で正しい層）を、同じベアメタル・カーネルの上で隔離しながら同時に最適化する。}
+
+TimelyLLM は EDF に 142\,\% の差をつけたが、あれは\emph{サーバ側 GPU の}
+スケジューリングである。ロボット側で、しかも硬いリアルタイム制御と同居させた例はない。
+本案は二層スケジューラを作る。
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{クラス1（硬）}：周期タスク。固定優先度＋tickless ワンショット。
+        既に rpi5 で 1\,kHz・ジッタ 3\,µs・0 ミスを実測済み。\keyp{これを一切劣化させない}のが制約。
+  \item \textbf{クラス2（軟）}：文脈配布・AIPL アクター。時間効用関数
+        $\mathrm{TUF}(t)=\min(\beta,\alpha(t-\mathrm{ERT})+\beta)$ で並べ替え、
+        クラス1の空き時間だけを使う。
+\end{itemize}
+
+\subsubsection*{実装項目}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item 二層 ready キューと、クラス2がクラス1を妨げないことの\keyp{実測による隔離検証}
+        （クラス2を過負荷にしてもクラス1が 0 ミスを保つこと）。
+  \item 効用密度による貪欲スケジューラ。TimelyLLM の PUD をベアメタルへ移植し、
+        ロボット側の実行時間見積りを組み込む。
+  \item 分割配布：10\,Hz で届く意味トークンを関節ごとの断片に切り、
+        効用順に12ノードへ配る。TimelyLLM の分割生成の\emph{配送側}にあたる。
+  \item GC の分離（\code{rtos\_plan} 課題③）。クラス2に AIPL の GC を閉じ込める。
+\end{enumerate}
+
+\subsubsection*{評価と主張できること}
+
+比較対象は FCFS・EDF・固定優先度。
+主張は2つ、\keyp{(i) クラス1の 0 ミスを保ったまま、(ii) クラス2の効用が EDF を上回る}。
+TimelyLLM の 142\,\% がベアメタル・分散でどう変わるかを示せれば、
+それ自体が独立した知見になる。
+
+\subsubsection*{規模とリスク}
+
+12ノードが要る。\prob{最大のリスクは時刻同期}で、効用の比較には
+ノード間で共通の時間軸が必要になる。PTP 対応スイッチを予算に入れる。
+
+\subsubsection*{投稿先}
+
+RTSS が本命。DATE / EMSOFT も射程。
+
+\subsection{案C：三層の計算配置と、WCET 保証つき機上推論}
+
+\subsubsection*{主張}
+
+\keyp{ニューラルネットの推論そのものを、ベアメタル上で WCET 上界つきで回す。}
+そのうえで、12関節×異種3世代ボードへの\keyp{配置を実機フィットネスで合成する}。
+
+既読5本は平均の制御周波数（6.06\,Hz など）は出すが、\prob{上界を出していない}。
+GPU とランタイム（CUDA、動的メモリ、キャッシュ）を前提にする限り、上界は原理的に出しにくい。
+ベアメタル Xinu なら、静的確保・固定小数点・キャッシュ制御込みで\emph{上界が言える}。
+これは本計画にしか主張できない立ち位置である。
+
+\subsubsection*{既存の評価との関係}
+
+本計画の 2026年7月21日の評価（\emph{6軸アームの制御に Xinu メッシュは効くか}）は、
+「\prob{関節サーボループにメッシュは効果がなく、むしろ有害}」と結論している。
+本案はこれと矛盾しない。\keyp{1関節1ノードとし、制御ループは各ノード内に閉じる}からである。
+ネットワークを跨ぐのは 5--10\,Hz の意味トークンだけであり、
+1\,kHz のループがネットワークを待つ構成は採らない。
+同評価が「効く」とした動作計画・分散知覚・冗長性が、本案では第2層・第3層にあたる。
+
+\subsubsection*{三層配置（詳細は第\ref{sec:mlhw}節）}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item 第3層（意味）：VLA 基盤モデル、5--10\,Hz、メッシュ\emph{外}の GPU。
+  \item 第2層（動作）：中規模方策（$\sim$7600万パラメータ）、8--30\,Hz、Jetson。
+  \item 第1層（関節）：\keyp{小型量子化方策（$\le$100万パラメータ）＋インピーダンス制御、
+        1\,kHz、各 Xinu ノード上}。ここに WCET 保証をかける。
+\end{itemize}
+
+\subsubsection*{実装項目}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item NEON int8 の固定小数点推論カーネル（GEMM）を、動的確保なし・
+        分岐なしで実装し、\keyp{サイクル単位の上界}を与える。
+  \item D-cache の明示管理（既に3ボードで成立済みの資産をここへ効かせる）。
+  \item 12関節×3世代への配置合成。\code{xinu-mesh-ga} の実機フィットネス方式を流用する。
+        既に\keyp{sim-to-real gap}を定量化した実績がある（モデル予測 1775\,ms に対し実測 2050\,ms、
+        手作業の均等分割が 1427\,ms で最速）。同じ現象が RT 配置でも起きるかを問う。
+  \item 混在クリティカリティ：関節ごとに重要度が違う（把持は安全上重い）ことを
+        配置の制約として扱う。
+\end{enumerate}
+
+\subsubsection*{評価と主張できること}
+
+WCET 上界と実測分布の乖離、および\keyp{異種世代の非自明な順位}。
+既に「分岐の多い探索では A53（rpi3）が A72（rpi4）に勝つ」という反直感的な実測がある。
+NN 推論でも同種の逆転が起きるなら、モデルベースの配置設計が誤ることの証拠になる。
+
+\subsubsection*{規模とリスク}
+
+3案でもっとも大きい。実機アームと36ボード規模が要る。
+\prob{最大のリスクは第1層方策の表現力}で、100万パラメータで関節制御が成り立つかは未検証である。
+まず1関節・シミュレーションで成立を確認してから実機へ広げる段取りとする。
+
+\subsubsection*{投稿先}
+
+RTAS / EMSOFT、journal なら IEEE TCAD や ACM TECS。
+機械学習側の会議（CoRL など）には\emph{向かない}。貢献が OS 側にあるためである。
+
+\subsection{案D：6ノード最小構成で三者を同時に satisfy する}
+\label{sec:planD}
+
+案A--C はいずれも百万円単位の機材を前提にする。
+案Dは\keyp{6ノードと小型アーム1台}に絞り、それでも
+機械学習・フィジカル AI・分散実時間 OS の三者が交わる主張を単独で完結させる。
+
+主張はこうである ──
+\keyp{文脈の齢を入力に持つ方策は、齢を持たない同一構造の方策より、
+遅延が変動する条件下で追従誤差が小さい。
+そしてその齢を信頼できる形で供給できるのは OS だけである。}
+
+実行可能性を支えるのは一つの発想の転換である。
+\keyp{遅延の研究に、遅延を生む実物は必要ない。}
+VLA は購入も実行もせず、上位層を既読論文の実測分布に従う\emph{遅延源}として再現する。
+これで機材費の大半が消え、しかも遅れ方を制御変数として掃引できる。
+
+\keyp{本案は本稿の推奨であり、第\ref{part:plan}部で独立した研究計画として詳述する。}
+以下ではまず4案を横に並べる。
+
+
+\subsection{4案の対比}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{3案の対比}
+\begin{tabularx}{\textwidth}{@{}l X l l@{}}
+\toprule
+ & \textbf{新規性の核} & \textbf{必要規模} & \textbf{直接経費} \\
+\midrule
+\textbf{案D 最小} & \textbf{齢を情報として方策に渡す。三者の交点を最小構成で} & \textbf{6ノード＋小型アーム} & \textbf{2,200 千円（2年）} \\
+案A 鮮度 & 鮮度を OS の契約にし、上位へ見せる & 3ノード＋計測器 & 4,200 千円（3年） \\
+案B 二層 & 硬締切と時間効用の単一カーネル共存 & 12ノード＋同期網 & 9,600 千円（3年） \\
+案C 三層 & ベアメタル NN 推論の WCET 上界＋実機配置合成 & 36ボード＋実機アーム & 14,500 千円（3年） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+\keyp{推奨は案D から入ること}である。
+案D は既存3ボードに3枚を買い足すだけで組め、しかも
+機械学習・フィジカル AI・分散実時間 OS の三者が交わる主張を単独で完結させられる。
+ここで得た鮮度の実測分布と、齢が効きはじめる境界が、そのまま案A・案B の入力になる。
+案C は案B の成果（時刻同期・配置基盤）が前提になるため、単独で先に始めると重い。
+
+\section{機械学習をどの計算機で実装するか}
+\label{sec:mlhw}
+
+\subsection{まず、学習と推論を分けて考える}
+
+研究室規模で\prob{VLA 基盤モデルを一から学習するのは不可能}である。
+80億パラメータ級の事前学習には数百 GPU 日を要し、既読論文の多くも
+公開済みモデル（$\pi_{0.5}$、GR00T、OmniVLA、SmolVLA）を出発点にしている。
+
+したがって設計方針は決まる。\keyp{大きいモデルは凍結して使い、
+小さいアダプタだけを学習する}。これは AsyncVLA の構成そのものであり、
+同時に予算的にも実行可能な唯一の道である。学習対象は次の2つに限る。
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item 第2層の\keyp{エッジ・アダプタ}（$\sim$7600万パラメータ）。単一 GPU で微調整可能。
+  \item 第1層の\keyp{関節方策}（$\le$100万パラメータ）。GPU 1枚で数時間規模。
+\end{itemize}
+
+\subsection{推論の三層と、それぞれの計算機}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{推論の三層配置}
+\label{tab:tier}
+\begin{tabularx}{\textwidth}{@{}l l l l X@{}}
+\toprule
+\textbf{層} & \textbf{規模} & \textbf{周期} & \textbf{計算機} & \textbf{根拠} \\
+\midrule
+第3層 意味 & $10^9$ & 5--10\,Hz & GPU ワークステーション（メッシュ外） &
+  機上に載る規模ではない。AsyncVLA の遠隔配置に倣う \\
+第2層 動作 & $10^7$--$10^8$ & 8--30\,Hz & Jetson AGX Orin / Thor（境界ノード1台） &
+  Jetson-PI の実測で 6--7.6\,Hz。ViT 級はここが下限 \\
+第1層 関節 & $\le 10^6$ & 1\,kHz & \keyp{各 Xinu ノード（A76, NEON int8）} &
+  下記の見積り。ここだけが WCET を言える層 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsubsection*{第1層が Xinu ノードで成立するかの見積り}
+
+100万パラメータの全結合方策を 1\,kHz で回すと、
+$2\times10^6\,\text{FLOP}\times10^3 = 2$\,GFLOP/s である。
+Cortex-A76 の NEON（128 bit、int8）なら演算能力としては十分な余裕がある。
+一方で第2層の 7600万パラメータを同じ場所で回すと $1.2$\,GFLOP/s 相当だが、
+こちらは\prob{帯域律速}になり、しかもベアメタルには BLAS も NPU もない。
+
+したがって\keyp{第1層は Xinu ノード上で成立しうるが、第2層は成立しない}。
+この線引きが案Cの出発点である。
+なお Jetson-PI が指摘した「機上では VLM も動作エキスパートも帯域律速になり、
+並列化が逆効果になる」という観察は、NPU を持たない Xinu ノードでは一層強く効く。
+
+\subsubsection*{既存資産との接続}
+
+\code{mecharm} 系で構想している「12 Xinu ＋ TinyML 強化学習」は、
+まさにこの第1層にあたる。本案はそれを\emph{WCET 保証つき}にする点で前進させる。
+
+\subsection{学習側の構成}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+  \item \textbf{学習機}：RTX 5090（32\,GB）級を2枚、CPU は多コア、
+        主記憶 256\,GB、NVMe 8\,TB。
+        7600万パラメータのアダプタ微調整と、時間オフセット拡張
+        （VLASH 方式）による再学習がここに収まる。
+  \item \textbf{推論機（第3層）}：上記の学習機を\emph{兼用}する。
+        実験時はロボットと同一 LAN に置く。AsyncVLA の実測（WiFi 0.28--6.0 秒）を見るかぎり、
+        有線にすれば遅延は大幅に小さくなるはずで、
+        \keyp{その差自体が案Aの鮮度分布の材料}になる。
+  \item \textbf{機上（第2層）}：Jetson AGX Orin 64\,GB を1台。
+        Jetson-PI が同系で 6.06\,Hz を出しているため、比較の基準機として妥当。
+  \item \textbf{保管}：実機ログは鮮度ラベル付きで貯める。40\,TB 級の NAS。
+\end{itemize}
+
+\subsection{データをどう集めるか}
+
+学習データは\prob{買えない}。実機から採るしかない。
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item \textbf{遠隔操作による模倣データ}：リーダー・アーム型の操作装置で人が動かし、
+        軌道を記録する。数百エピソード規模。
+  \item \textbf{鮮度ラベル}：本計画に固有の要件である。
+        全記録に\keyp{そのとき文脈が何 µs 古かったか}を付ける。
+        これが無いと、案Aの「鮮度を条件として与える」学習ができない。
+        通常のデータ収集系には無い項目なので、収集系の設計時に入れておく必要がある。
+  \item \textbf{シミュレーション}：第1層方策の事前学習に使う。
+        既存の DOFBOT 忠実シミュレータを流用できる。
+\end{enumerate}
+
+\section{研究予算}
+
+\subsection{考え方}
+
+3案とも3年計画とし、直接経費で示す（間接経費30\,\%は別途）。
+以下は\emph{概算}であり、機材価格は2026年8月時点の想定である。
+
+\medskip
+\noindent
+\keyp{計測器を必ず計上すること。}
+OS が自分でジッタを測ると循環論法になる。
+本計画がこれまで得た「1\,kHz でジッタ 3\,µs」も、
+カーネル内部の計時に依存している。\prob{査読で必ず突かれる}ので、
+ロジック・アナライザで GPIO を外から観測した独立な裏付けを用意する。
+これは3案すべてに共通する必須項目である。
+
+\subsection{案D：6ノード最小構成（推奨・小規模）}
+
+\keyp{2年・直接経費 2,200 千円}（内訳と年次配分は第\ref{part:plan}部第\ref{sec:budgetD}節）。
+科研費なら\keyp{挑戦的研究（萌芽）}あるいは\keyp{基盤研究(C)}の小さめの枠、
+学内研究費でも射程に入る。旅費と人件費を別財源で賄えるなら物品費 870 千円で着手できる。
+
+\subsection{案A：鮮度を OS 抽象にする（小規模）}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{案Aの予算（3年・直接経費、単位：千円）}
+\begin{tabularx}{\textwidth}{@{}l X r@{}}
+\toprule
+\textbf{費目} & \textbf{内訳} & \textbf{金額} \\
+\midrule
+物品費 & ロジック・アナライザ（16ch, 500\,MS/s 級） & 400 \\
+       & 追加ノード（Raspberry Pi 5 ×4、電源・SD・配線） & 200 \\
+       & 学習・推論用ワークステーション（RTX 5090 ×1、256\,GB） & 900 \\
+       & 測定用オシロスコープ（4ch, 200\,MHz） & 300 \\
+\midrule
+旅費 & 国際会議（RTSS / EMSOFT）2回 & 900 \\
+     & 国内研究会 3回 & 200 \\
+\midrule
+人件費・謝金 & 研究補助（学生 RA）3年 & 600 \\
+\midrule
+その他 & 英文校閲、投稿料・OA 費用 & 550 \\
+       & 消耗品（基板、ケーブル、記録媒体） & 150 \\
+\midrule
+\textbf{合計} & & \textbf{4,200} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+科研費\keyp{基盤研究(C)}（3年・総額500万円以内）の枠に収まる。
+新規ハードウェアが少なく、既存の3ボードで着手できるのが利点である。
+
+\subsection{案B：二層スケジューラ（中規模）}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{案Bの予算（3年・直接経費、単位：千円）}
+\begin{tabularx}{\textwidth}{@{}l X r@{}}
+\toprule
+\textbf{費目} & \textbf{内訳} & \textbf{金額} \\
+\midrule
+物品費 & 12ノード分のボード（Pi5 ×8、Pi4 ×4）と電源・筐体 & 800 \\
+       & PTP 対応スイッチ、配線、時刻同期用機材 & 400 \\
+       & ロジック・アナライザ、オシロスコープ & 700 \\
+       & 学習・推論用ワークステーション（RTX 5090 ×2、256\,GB、8\,TB） & 1,800 \\
+       & Jetson AGX Orin 64\,GB（第2層の基準機） & 400 \\
+       & 6軸アーム実機（評価用） & 700 \\
+\midrule
+旅費 & 国際会議 4回（うち2回は学生同行） & 1,800 \\
+     & 国内 & 300 \\
+\midrule
+人件費・謝金 & 学生 RA 2名 ×3年 & 1,800 \\
+\midrule
+その他 & 英文校閲、投稿料・OA、消耗品 & 900 \\
+\midrule
+\textbf{合計} & & \textbf{9,600} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+科研費\keyp{基盤研究(B)}相当。案Aの成果を前提にすると採択の説得力が上がる。
+
+\subsection{案C：三層配置と WCET 保証つき機上推論（大規模）}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{案Cの予算（3年・直接経費、単位：千円）}
+\begin{tabularx}{\textwidth}{@{}l X r@{}}
+\toprule
+\textbf{費目} & \textbf{内訳} & \textbf{金額} \\
+\midrule
+物品費 & 実機アーム（6軸 ×2 台、または双腕1台） & 2,500 \\
+       & 遠隔操作装置（リーダー・アーム、データ収集用） & 300 \\
+       & ボード 36 枚（3世代 ×12）、電源・ラック・冷却 & 1,600 \\
+       & PTP 網、計測器一式（ロジアナ・オシロ・電力計） & 1,100 \\
+       & 学習用ワークステーション（RTX 5090 ×2）＋ Jetson AGX Thor & 2,300 \\
+       & データ保管 NAS 40\,TB & 400 \\
+\midrule
+旅費 & 国際会議 5回、国内 & 2,600 \\
+\midrule
+人件費・謝金 & 学生 RA 3名 ×3年 & 2,700 \\
+\midrule
+その他 & 英文校閲、投稿料・OA、消耗品、安全対策（囲い・非常停止） & 1,000 \\
+\midrule
+\textbf{合計} & & \textbf{14,500} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+科研費\keyp{基盤研究(B)の上限〜(A)}相当。
+実機アームを扱うため\prob{安全対策の費用を必ず計上する}こと
+（囲い、非常停止、リスクアセスメント）。
+フィジカル AI は人を傷つけ得るという本計画自身の問題意識と整合する。
+
+\subsection{段階的に進める場合の推奨}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{推奨する進め方}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{時期} & \textbf{案} & \textbf{狙い} \\
+\midrule
+1--2年目 & \textbf{案D（萌芽／基盤C, 220万円）} & \textbf{6ノード＋実機アームで着手。齢が効く境界を同定し、最初の論文にする} \\
+2--5年目 & 案A（基盤C, 420万円） & 案Dの分布を根拠に、鮮度を型と契約へ一般化する \\
+5--8年目 & 案B（基盤B, 960万円） & 12ノードへ拡大。時刻同期基盤を整える \\
+8年目--   & 案C（基盤B〜A, 1,450万円） & 案Bの基盤の上で WCET 保証つき機上推論へ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+総額を一度に取りにいくより、\keyp{案Dで「齢を渡す」という主張を先に論文化しておく}方が、
+後続の申請で「我々が提唱した枠組み」と書けるぶん有利になると思われる。
+案Dは2年・220万円で、しかも\keyp{三者（機械学習・フィジカル AI・分散実時間 OS）が
+交わる主張を単独で完結させられる}点が要である。
+
+
+\part{研究計画 ── 案D「文脈の齢を渡す実時間 OS」}
+\label{part:plan}
+
+\section{学術的な問い}
+
+本研究が立てる問いは一つである。
+
+\begin{quote}
+\keyp{文脈の「齢」を情報として与えられた制御方策は、
+与えられない方策より良く振る舞うか。振る舞うとすれば、どの条件下でか。
+そして、その齢を信頼できる形で供給できるのは誰か。}
+\end{quote}
+
+\noindent
+最後の問いに対する本研究の答えは\keyp{オペレーティングシステムである}。
+アプリケーションは自分がいつ止められ、いつ再開されたかを知らない。
+経過時間を正しく測れるのは、止めた側だけである。
+
+\subsection{既存研究との決定的な差}
+
+AsyncVLA は、エッジ方策を「古い意味情報が来る」前提で\emph{学習}することで解いた。
+学習時にわざと観測をずらし、古い特徴から現在の動作を出すよう強制する。
+これは巧妙だが、\prob{方策に齢そのものを渡してはいない}。
+渡せなかったのである ── OS が教えないからである。
+
+本研究はその一手先を行く。齢を\emph{暗黙に吸収させる}のではなく、
+\keyp{明示的な入力として渡す}。すると方策は、
+「文脈が新しいときは意味情報を信じ、古いときは自分の状態推定を重んじる」
+といった条件分岐を学習できる。
+
+\section{これまでの準備状況}
+
+本計画は白紙から始まるものではない。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{既に到達している地点}
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+\textbf{資産} & \textbf{状態} \\
+\midrule
+ベアメタル RTOS & Embedded Xinu を Raspberry Pi 3/4/5（A53/A72/A76）へ移植済。
+  優先度付きプリエンプティブ・スケジューラ、tickless ワンショット・タイマ、
+  ネットワークスタックのタイマ ISR からの分離を実装済 \\
+\keyp{実時間性の実測} & \keyp{rpi5 で 1\,kHz 周期タスクのジッタ 3\,µs・200周期中の締切超過 0}
+  （全コア負荷下）。rpi4 は 228\,µs、rpi3 は 57\,µs \\
+アクター言語 AIPL & 自作。型付きメッセージ交換による並行記述。3ボード上で動作 \\
+分散実行基盤 & 4コア SMP ×3ボード、Wi-Fi アドホック・メッシュ、12コア分散実行を実証済 \\
+アーム制御の設計 & 6軸アーム DOFBOT を1軸1ノードで制御する全体設計を文書化済
+  （2026年7月、9ページ）。忠実な3Dシミュレータも実装済 \\
+HIL の実績 & ドローン救助シミュレーションと実機 Xinu の
+  ハードウェア・イン・ザ・ループを構築済 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+すなわち\keyp{速い層は既に足りている}。
+System~1（サーボ指令）の要求が 120\,Hz ＝ 1周期 8.3\,ms であるのに対し、
+実測はジッタ 3\,µs である。\keyp{3桁の余裕}がある。
+不足しているのは速さではなく、\prob{遅い層との繋ぎ方}である。
+
+\section{研究方法（案D）}
+
+\subsection{発想の転換 ── 上位層の実物は要らない}
+
+本研究の実行可能性を支える鍵はここにある。
+
+\keyp{遅延の研究に、遅延を生む実物は必要ない。}
+リアルタイム系の研究では、負荷を\emph{負荷モデル}で置き換えるのが標準的な作法である。
+
+したがって本研究は VLA 基盤モデルを\prob{購入せず、動作させない}。
+代わりに上位層を\keyp{実測分布に従う遅延源}として再現する。
+分布は既読論文が公開している値
+（AsyncVLA の WiFi 実測 0.28--6.0 秒、Jetson-PI の1推論 412.9\,ms）を用い、
+必要なら手元の1台で一度だけ較正する。
+
+これには二つの利点がある。第一に\keyp{機材費の大半が消える}。
+第二に、そしてより重要なことに、\keyp{遅れ方を制御変数として掃引できる}。
+実物を使うと遅延は与件になるが、モデルなら独立変数にできる。
+本研究の主眼は「どの遅延条件下で齢が効きはじめるか」の同定であるから、
+掃引できることは実物に対する\emph{優位性}である。
+
+\subsection{システム構成}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{6ノードの構成}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{要素} & \textbf{台数} & \textbf{役割} \\
+\midrule
+関節ノード & 6 & 6軸アームの各関節に1台。1\,kHz の制御ループを\keyp{自ノード内で閉じて}回す。
+  小型量子化方策（$\le$5万パラメータ、int8）をベアメタルで実行 \\
+上位層代理 & 1 & 実測分布に従って遅れる目標姿勢・意味トークンを 5--10\,Hz で配る。
+  関節ノードの1台に相乗りさせるか、手元 PC に置く \\
+被制御対象 & 1 & 6軸小型アーム実機（DOFBOT 級） \\
+外部計測 & 1式 & ロジック・アナライザ。GPIO を外から観測し、
+  \keyp{カーネル内部の計時に依存しない裏付け}を取る \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+既存の3ボード（rpi3/rpi4/rpi5）に3枚を買い足せば6ノードになる。
+\keyp{異種3世代が混ざる構成}は偶然の産物だが、
+そのまま「混在ハードウェアにおける鮮度上界」という副次的な問いを生む。
+同一構成6台より論点が多い。
+
+\subsection{OS 側の実装項目}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
+  \item \keyp{齢の測定と伝播}。各メッセージに生成時刻を持たせ、
+        配送時に実測経過時間を添える。実行時 API \code{ctx\_age\_us()} を提供する。
+  \item \keyp{鮮度契約}。経路ごとに上界 $D$ を与え、$D$ を超えた文脈は配送せず破棄する。
+        現在の実装はメールボックス溢れ時に暗黙に取りこぼしている（\code{cc.c:532}）。
+        これを\emph{意図された方針}に置き換える ──
+        文脈クラスは最新優先で上書き、指令クラスは取りこぼし禁止とする。
+  \item \keyp{ノード間の時刻同期}。齢を比較するには共通の時間軸が要る。
+        6ノード規模なら簡素な同期で足りる見込みだが、同期誤差が齢の測定誤差に
+        直接効くため、\emph{同期誤差自体を測って報告する}。
+  \item \keyp{ベアメタル推論}。NEON int8 の固定小数点カーネルを、
+        動的確保なし・データ依存分岐なしで実装し、WCET 上界を与える。
+\end{enumerate}
+
+\section{学習の設計 ── アームの動作を何から、どう学ぶか}
+\label{sec:learn}
+
+\subsection{学習する範囲と、しない範囲}
+
+まず範囲をはっきりさせる。\prob{アームが「何をするか」は本計画では学習しない。}
+それは上位層（VLA）の仕事であり、本計画ではそれを遅延源として模擬する（第\ref{sec:planD}節）。
+学習するのは下の層である。
+
+\begin{quote}
+\keyp{遅れて届いた指令を、その遅れ具合を知ったうえで、どう実行するか。}
+\end{quote}
+
+\noindent
+タスク水準の行動学習（把持の巧拙、物体の選択など）は案Cの範囲であり、
+本計画は\emph{そこへ至る前提}にあたる時間的整合の問題だけを扱う。
+範囲を狭めることが、2年・220万円という規模を成立させている。
+
+\subsection{方策の入出力}
+
+1関節あたり1つの方策を置く。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{関節方策の入出力（1関節あたり）}
+\begin{tabularx}{\textwidth}{@{}l X r@{}}
+\toprule
+ & \textbf{内容} & \textbf{次元} \\
+\midrule
+入力 & 自関節の角度 $\theta$、角速度 $\dot\theta$、追従誤差、積分項 & 4 \\
+     & 上位から来た目標 $\theta_{\mathrm{target}}$、$\dot\theta_{\mathrm{target}}$ & 2 \\
+     & \keyp{齢 $a$（µs、正規化）} & 1 \\
+     & 隣接関節の状態（メッシュ経由。これも齢つき） & 4--6 \\
+\midrule
+出力 & 関節指令（位置または電流） & 1 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+12次元前後の入力、隠れ層 $64\times2$、1出力で\keyp{5千--1万パラメータ}である。
+上限に置いた5万には余裕がある。畳み込みも注意機構も要らない。
+\prob{1\,kHz で回すには、この規模でなければ入らない}（第\ref{sec:mlhw}節の見積り）。
+
+\subsection{学習法 ── 特権教師つき模倣学習}
+
+設計の肝はここにある。
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
+  \item \keyp{教師を作る}（シミュレータ上）。
+        既存の DOFBOT 忠実シミュレータで、\keyp{遅延ゼロ}の理想コントローラ
+        （軌道生成＋PD／インピーダンス制御）を走らせる。
+        教師は「いま本当の目標がどこにあるか」を知っている。
+  \item \keyp{生徒には遅れた情報だけ渡す}。同じ場面で、目標を人工的に遅らせたものと
+        その齢だけを生徒に見せ、\emph{教師と同じ指令を出す}よう学習させる。
+  \item \keyp{遅延を掃引してデータを作る}。0.1\,ms から数百 ms まで遅延を変えた軌跡を生成する。
+        VLASH の時間オフセット拡張と同じ発想である。
+  \item \keyp{実機で微調整}。摩擦・バックラッシュ・サーボの応答遅れはシミュレータと合わない。
+        遠隔操作で数十エピソードを集め、出力層近くだけを調整する。
+\end{enumerate}
+
+\noindent
+教師は未来を知っており、生徒は知らない。
+しかし生徒は\keyp{自分がどれだけ遅れているかは知っている}。
+この非対称性が学習の駆動力になる。
+ロボティクスでは確立した枠組み（privileged learning / Learning by Cheating 系）であり、
+\keyp{手法自体の新規性を主張する必要がない}。
+そのぶん主張を「齢の有無」の一点に絞れるのが利点である。
+
+\subsection{なぜ強化学習を使わないか}
+
+6軸アームで 1\,kHz の強化学習は、実機では危険であり、データ効率も悪すぎる。
+加えて本研究の問いは「最適制御の発見」ではなく\keyp{齢の情報が効くか}である。
+教師との差がそのまま評価量になる模倣学習のほうが、問いに直結する。
+
+\medskip
+\noindent
+\prob{ただし限界を明記しておく。}
+\keyp{教師自身が失敗する大遅延領域は、模倣では学べない}。
+遅延が十分大きければ遅延ゼロの教師に追随することは原理的に不可能であり、
+その領域は本計画の範囲外とする。
+「どこまで教師に追随でき、どこから追随できなくなるか」の境界を示すことが、
+本計画が約束できる範囲である。
+
+\subsection{対照実験の作り方}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{方策 P0（齢なし）}：入力から $a$ を除く。
+  \item \textbf{方策 P1（齢あり）}：$a$ を含む。
+\end{itemize}
+
+\noindent
+この2つを\keyp{同一構造・同一データ・同一学習量}で学習させる。
+P0 にも $a$ の入力端子を持たせて常にゼロを流すなど、\prob{容量を厳密に揃える}こと。
+揃えないと、測っているのは齢の効果ではなく単なる容量差になる。
+\keyp{実験計画で最も間違えやすい点}である。
+
+\subsection{量子化と実機への載せ方}
+
+学習は float32 で行い、事後量子化で int8 に落とす。
+Xinu ノード上では固定小数点で推論し、動的確保もデータ依存分岐も持たない
+（第\ref{sec:planD}節の WCET 要件）。
+\keyp{量子化誤差が制御性能をどれだけ損なうかも測る}。
+ベアメタルでの量子化推論と制御品質の関係は、それ自体が報告に値する。
+
+\subsection{データ収集と鮮度ラベル}
+
+学習データは買えない。実機とシミュレータから採る。
+ここで\keyp{通常の収集系にはない項目}が要る。
+
+\begin{quote}
+\keyp{全記録に「そのとき文脈が何 µs 古かったか」を付す。}
+\end{quote}
+
+\noindent
+これが無ければ、齢を条件として与える学習そのものができない。
+収集系の設計時点で入れておく必要があり、後から足すことはできない
+（過去の記録に遡って齢を復元する手段がないため）。
+
+\section{外部計測の設計 ── ロジック・アナライザで何を測るか}
+\label{sec:measure}
+
+\subsection{なぜ外部計測が要るか}
+
+\prob{OS が自分でジッタを測ると循環論法になる。}
+研究代表者が既に得ている「1\,kHz でジッタ 3\,µs」も、
+カーネル内部の計時に依存しており、外からの裏付けを持たない。
+本計画の主張は「\keyp{OS が齢を保証する}」であるから、
+その保証自体を外部から検証しないかぎり、主張は自己言及で閉じてしまう。
+
+\subsection{測る4つの量}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{ロジック・アナライザで測る量}
+\begin{tabularx}{\textwidth}{@{}l X l@{}}
+\toprule
+\textbf{量} & \textbf{測り方} & \textbf{内部計測で可能か} \\
+\midrule
+① 周期タスクの起動時刻 &
+  RT タスクの先頭で GPIO を1本トグルし、立ち上がりエッジの時刻列を記録。
+  \keyp{間隔の分布がそのまま真のジッタ}になる & 可能だが要裏付け \\
+\midrule
+② 割り込み応答遅延 &
+  外部から既知のタイミングでパルスを入力し、応じる ISR が別ピンを立てるまでを測る。
+  入力エッジ→出力エッジの時間 & \prob{不可能} \\
+\midrule
+\keyp{③ 端点間の齢} &
+  ノードA（上位層代理）が送出する瞬間と、ノードB（関節）が制御ループで
+  消費する瞬間に、それぞれピンを立てる。\keyp{2信号の時間差が真の齢} &
+  \prob{不可能} \\
+\midrule
+④ 推論の実行時間／
+  ノード間の時刻同期誤差 &
+  推論カーネルの入口・出口をトグルし、パルス幅の最大値を取る。
+  同期プロトコル上の同一時刻に全ノードがピンを立て、そのズレを見る &
+  \prob{不可能}（同期誤差） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+\keyp{③が本計画の土台である。}
+外部で測った真の齢と、ノードが \code{ctx\_age\_us()} で自己申告した値を突き合わせ、
+\keyp{OS の申告が正しいことを外から示す}。
+これができて初めて、「齢を渡す」という主張が成立する。
+
+\subsection{なぜオシロスコープではなくロジック・アナライザか}
+
+\keyp{多チャンネルを共通の時間軸で同時記録できる}からである。
+③のようにノードをまたぐ時間差を測るには、
+1台の計器で全ノードの信号を同時に見なければならない。
+6ノード $\times$ 2信号＋上位層＋トリガで 14 チャンネル程度、16 チャンネル機で足りる。
+
+加えて、裾（99.9 パーセンタイル）を論じるには
+1\,kHz $\times$ 10 秒 $=$ 1万周期規模の連続記録が要る。
+生のサンプルで保持するのは非現実的なので、
+\keyp{遷移のみを圧縮記録できる機種}を選ぶ必要がある。
+分解能は 2--10\,ns あれば足りる（3\,µs のジッタに対して3桁の余裕）。
+
+\subsection{測定側の落とし穴}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
+  \item \prob{GPIO トグル自体のコスト}が測定値に乗る（数十--数百 ns）。
+        空ループでのトグル間隔を較正して差し引く。
+  \item \prob{観測が対象を変える}。GPIO 書き込みはバスとキャッシュに影響する。
+        \keyp{トグルあり／なしで制御性能に差が出ないこと}を確認し、
+        影響が無視できる範囲であることを示す。
+  \item 計器自身のサンプリング・ジッタ（$\pm$1 サンプル）と、
+        配線長による伝搬遅延（数 ns）。いずれも本計画の µs 水準では無視できるが、
+        \emph{無視できると書くために一度は測る}。
+\end{enumerate}
+
+
+\section{評価計画と成功基準}
+
+\subsection{測る量}
+
+いずれも第\ref{sec:measure}節の外部計測で取る。
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
+  \item \keyp{端点間の齢の分布}。平均ではなく最悪値と裾で示す。6ノード分を重ねる。
+  \item \keyp{齢あり／齢なしの追従誤差}を、上位層の遅延分布を掃引しながら比較する。
+  \item \keyp{WCET 上界と実測分布の乖離}（上界の tightness）。異種3世代で別々に出す。
+  \item \keyp{対照実験}：齢を意図的に誤って渡した場合の劣化。
+        OS の保証が効いていることは、保証を壊してみせて初めて示せる。
+\end{enumerate}
+
+\subsection{合格ライン}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{定量的な成功基準}
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+\textbf{項目} & \textbf{基準} \\
+\midrule
+6ノード同時稼働時の関節制御 & 1\,kHz を維持し、締切超過 0 \\
+端点間の齢 & 99.9 パーセンタイルが設計上界 $D$ 以内 \\
+齢の効果 & 遅延の標準偏差が制御周期の一定倍を超える領域で、
+  追従誤差 RMS を\keyp{有意に改善}（改善幅そのものは事前に約束しない） \\
+WCET の tightness & 実測最大が上界の 80\,\% 以上（緩すぎる上界は役に立たない） \\
+外部計測との整合 & ロジック・アナライザによる実測とカーネル内計時の差が既知の範囲 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+\keyp{「齢の効果」の基準を数値で約束していないのは意図的である。}
+効果の大きさは遅延分布に依存し、事前には決まらない。
+本研究が約束するのは\emph{効果の有無と、効きはじめる境界の同定}である。
+
+\section{年次計画}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{2年間の計画}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{時期} & \textbf{主題} & \textbf{内容} \\
+\midrule
+1年目 前期 & 基盤整備 & 6ノード化。齢の測定・伝播 API と鮮度契約の実装。
+  外部計測系（ロジック・アナライザ）の確立と、既存の 1\,kHz/3\,µs 実測の\emph{外部からの再確認} \\
+1年目 後期 & 学習と模擬 & 小型方策のシミュレータ上での学習。
+  齢あり／なしの比較をまずシミュレーションで実施。遅延負荷モデルの較正 \\
+2年目 前期 & 実機統合 & DOFBOT 実機と6ノードの統合。ベアメタル推論の WCET 解析。
+  端点間の齢の実測分布を取得 \\
+2年目 後期 & 掃引と執筆 & 遅延掃引実験、対照実験。国内研究会で発表し、
+  査読つき論文へ投稿 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+\keyp{1年目後期の時点で、シミュレーションだけで主張の成否が判る}ように組んである。
+そこで効果が見えなければ、2年目の実機統合の前に問いの立て方を修正できる。
+
+\section{想定される困難と対処}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=4pt]
+  \item \prob{齢を渡しても差が出ない。}
+        最大のリスクである。遅延が小さい領域では齢の情報は役に立たないはずで、
+        効くのは遅延が制御周期に対して大きい領域に限られる。
+        \keyp{これは失敗ではなく境界の同定である}。
+        「どこから齢が効きはじめるか」を示せればそれ自体が結果になるよう、
+        評価計画を掃引型にしてある。
+  \item \prob{小型方策の表現力が足りない。}
+        5万パラメータで関節制御が成り立つかは未検証である。
+        まず1関節・シミュレーションで成立を確認してから6軸へ広げる段取りとする。
+        成立しない場合は、方策を補正項に限定し、
+        主たる制御は古典的なインピーダンス制御に委ねる構成へ退く。
+  \item \prob{時刻同期誤差が齢の測定精度を支配する。}
+        同期誤差そのものを測って報告し、齢の議論をその精度の範囲に限定する。
+        必要なら有線化する。
+  \item \prob{実機アームの分解能が足りず、制御誤差の差が観測できない。}
+        DOFBOT 級の安価なアームはエンコーダ分解能が低い。
+        シミュレーションでの結果を主、実機を「実在することの証拠」と位置づける
+        二段構えにしておく。
+\end{enumerate}
+
+\section{研究経費（案Dの年次内訳）}
+\label{sec:budgetD}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{2年間の直接経費（単位：千円）}
+\begin{tabularx}{\textwidth}{@{}l X r r r@{}}
+\toprule
+\textbf{費目} & \textbf{内訳} & \textbf{1年目} & \textbf{2年目} & \textbf{計} \\
+\midrule
+物品費 & 6軸小型アーム実機（DOFBOT 級）1台 & --- & 120 & 120 \\
+       & Raspberry Pi 5 ×3 追加、電源・配線・筐体 & 100 & --- & 100 \\
+       & ロジック・アナライザ（16ch） & 400 & --- & 400 \\
+       & 学習用 GPU 1枚（既存 PC への増設） & 250 & --- & 250 \\
+\midrule
+旅費 & 国際会議 1回（WiP／ポスター想定） & --- & 450 & 450 \\
+     & 国内研究会 3回 & 100 & 100 & 200 \\
+\midrule
+人件費・謝金 & 学生 RA & 200 & 200 & 400 \\
+\midrule
+その他 & 英文校閲、投稿料・OA、消耗品 & 80 & 200 & 280 \\
+\midrule
+\textbf{合計} & & \textbf{1,130} & \textbf{1,070} & \textbf{2,200} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+\keyp{計測器を必ず計上している点を強調しておく。}
+OS が自分でジッタを測ると循環論法になる。
+研究代表者が既に得ている「1\,kHz でジッタ 3\,µs」もカーネル内部の計時に依存しており、
+\prob{査読で必ず問われる}。外部からの独立な裏付けは省略できない。
+
+\medskip
+\noindent
+\textbf{さらに切り詰める場合。}
+旅費と人件費を別財源で賄えるなら、物品費 870 千円で着手できる。
+ただし削ってよいものとそうでないものがある。
+アームを数値積分（HIL）に置き換えれば 120 千円減るが、
+\prob{実機で動かした図のない論文はフィジカル AI としては弱い}。
+ロジック・アナライザは学内の共用設備で代替しうるが、
+\prob{計測そのものを省いてはならない}。
+
+\section{期待される成果と波及}
+
+\subsection{学術的な成果}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item \keyp{「齢を渡す」という新しい設計軸}の提示と、その有効領域の同定。
+  \item ベアメタル上のニューラルネット推論に対する\keyp{WCET 上界}の実測つき提示。
+        既存研究は平均の制御周波数しか示していない。
+  \item 異種世代混在環境における鮮度上界の実測。
+\end{enumerate}
+
+\subsection{発表計画}
+
+まず国内（情報処理学会 組込みシステム研究会／システムソフトウェアとオペレーティング・システム研究会）で
+議論を経たうえで、査読つき国際会議（RTAS）または論文誌（ACM TECS）へ投稿する。
+規模の小ささを踏まえ、国際会議では Work-in-Progress 枠も現実的な選択肢とする。
+
+\subsection{後続研究への接続}
+
+本計画で得る\keyp{齢の実測分布と、齢が効きはじめる境界}は、
+そのまま次の段階の入力になる。
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item 鮮度を AIPL の型として表現し、経路ごとの上界を静的に検査する（言語設計への展開）。
+  \item ハード締切クラスと時間効用クラスを単一カーネルで共存させる
+        スケジューラ設計（12ノードへの拡大）。
+\end{itemize}
+
+\noindent
+すなわち本計画は、\keyp{最小の投資で主張の核を先に確立し、
+後続の大型計画で「我々が提唱した枠組み」と書けるようにする}ことを狙っている。
+
+\section*{文献}
+
+\begingroup\sloppy
+\begin{enumerate}[leftmargin=1.8em,itemsep=2pt,label={[\arabic*]}]
+  \item N.~Hirose, C.~Glossop, D.~Shah, S.~Levine.
+        \emph{AsyncVLA: An Asynchronous VLA for Fast and Robust Navigation on the Edge}.
+        arXiv:2602.13476, 2026.\ \url{https://arxiv.org/abs/2602.13476}
+  \item \emph{Jetson-PI: Towards Onboard Real-Time Robot Control via
+        Foresight-Aligned Asynchronous Inference}.
+        arXiv:2607.12659, 2026.\ \url{https://arxiv.org/abs/2607.12659}
+  \item \emph{VLASH: Real-Time VLAs via Future-State-Aware Asynchronous Inference}.
+        arXiv:2512.01031, 2025.\ \url{https://arxiv.org/abs/2512.01031}
+  \item N.~Ling, G.~Chen, L.~Zhong.
+        \emph{TimelyLLM: Segmented LLM Serving System for Time-sensitive
+        Robotic Applications}.
+        arXiv:2412.18695, 2024.\ \url{https://arxiv.org/abs/2412.18695}
+  \item \emph{Safe LLM-Controlled Robots with Formal Guarantees via
+        Reachability Analysis}.
+        arXiv:2503.03911, 2025.\ \url{https://arxiv.org/abs/2503.03911}
+\end{enumerate}
+\endgroup
+
+\end{document}
