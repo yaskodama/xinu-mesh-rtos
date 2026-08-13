@@ -1,0 +1,519 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[a4paper,margin=22mm]{geometry}
+\usepackage{xeCJK}
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{pgfplots}
+\usepackage{hyperref}
+
+\pgfplotsset{compat=1.18}
+
+\setCJKmainfont{Hiragino Mincho ProN}
+\setCJKsansfont{Hiragino Sans}
+\setCJKmonofont{Hiragino Sans}
+\setmonofont{Menlo}[Scale=0.82]
+
+\xeCJKDeclareCharClass{CJK}{"2460 -> "24FF, "2013 -> "2015, "2018 -> "201F, "2026, "2500}
+
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue!60!black,
+  pdftitle={案E 第一次結果 —— 齢を状態に持つ方策は、模倣が届かない遅延領域を取れるか},
+  pdfauthor={児玉靖司}}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\prob}[1]{\textbf{\textcolor{red!55!black}{#1}}}
+\newcommand{\keyp}[1]{\textbf{\textcolor{blue!45!black}{#1}}}
+
+\title{\vspace{-12mm}
+  \Large 案E 第一次結果\\[2mm]
+  \large 齢を状態に持つ方策は、模倣が届かない遅延領域を取れるか\\[1mm]
+  \normalsize ―― シミュレータだけで出した一次結果と、そこで見つかった実験設計の誤り\\[1mm]}
+\author{\normalsize 児玉靖司}
+\date{\normalsize 2026年8月12日}
+
+\begin{document}
+\maketitle
+\vspace{-6mm}
+
+\begin{abstract}
+\noindent
+「機械学習・強化学習によるロボットアーム／フィジカル AI 研究」（2026年8月12日）で示した
+\keyp{案E}に着手し、\keyp{機材を買う前にシミュレータだけで出せる一次結果}をここに報告する。
+1 関節・1\,kHz の位置サーボに対し、上位からの目標が遅れて届く状況を作り、
+\keyp{模倣学習と強化学習 $\times$ 齢の有無}の4条件を\emph{同一容量・同一軌道}で比較した。
+
+結果は\keyp{仮説を半分支持し、半分否定した}。
+支持された側 ―― \keyp{遅延 400\,ms 以上では強化学習が模倣学習を 5 種すべてで上回る}
+（400\,ms で $-28\,\%$、800\,ms で $-15\,\%$）。
+案Eの中心にある「\emph{教師が失敗する領域は模倣では学べず、そこは強化学習が取る}」が
+実際に観測された。
+否定された側 ―― \prob{齢の効果は遅延が大きいほど薄れ、400\,ms では逆に害になった}
+（模倣で $+22\,\%$、勝ち 1/5 種）。
+
+否定の原因は方策側ではなく\prob{実験設計}にあった。
+遅延を1回の走行のあいだ一定にしたため、\keyp{齢は「定数＋配布周期の位相」に退化し、
+定数部分は学習で重みに吸収される}。案Eの主張は「\emph{遅延が変動する条件下で}」であり、
+掃引すべき軸は遅延の大きさではなく\keyp{遅延のばらつき}であった。
+
+そこで軸を替えて実験2を行い、\keyp{主張は支持された}。
+文脈生成のジッタを $\pm 0$ から $\pm 200$\,ms へ広げると、齢の効果は
+\keyp{$-10\,\%$ から $-34\,\%$ へ単調に強まり、$\pm 50$\,ms 以上では5種すべてで齢ありが勝つ}。
+すなわち\keyp{齢が効くのは遅延が大きいときではなく、遅延がばらつくときである}。
+一方\prob{強化学習側では両実験とも齢の効果が検出できず}、
+CEM が齢を使う解に届いていない疑いが残った。
+\end{abstract}
+
+\vspace{-2mm}
+{\small\tableofcontents}
+
+\section{これは何か}
+
+\code{docs/ml\_rt\_proposals.pdf} 第8節（案E）の着手ぶんである。
+案Eは3年・380万円の計画だが、\keyp{その一次結果は装置を買わずに出せる}と書いた。
+本稿はそれを実行した記録であり、実装は \code{xinu-mesh-rtos/planE/}（純 Python、依存ゼロ）にある。
+
+問いは次の一文である。
+
+\begin{quote}
+\keyp{遅延を「情報として与えられた」方策は、遅延を「上界としてのみ扱う」方策より
+どれだけ良くなれるか。そして模倣が原理的に届かなくなる領域を、強化学習は取れるか。}
+\end{quote}
+
+案D（\code{vla\_rt\_review.pdf} 第III部）は「齢が効く」ことを特権教師つき模倣学習で示す計画だが、
+\prob{教師自身が失敗する大遅延領域は模倣では学べない}と自ら範囲外を宣言している。
+本実験はその境界を実測し、その先を強化学習が取れるかを見る。
+
+\section{実験系}
+
+\subsection{6つの条件}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{比較する6条件。方策はすべて同一構造・同一パラメータ数（121）}
+\begin{tabularx}{\textwidth}{@{}l X l@{}}
+\toprule
+\textbf{条件} & \textbf{制御} & \textbf{齢 $a$ と $\hat a$} \\
+\midrule
+\code{teacher} & 遅延ゼロの理想制御（先行補償つき PD）。\keyp{性能の下界} & 本当の目標を知っている \\
+\code{naive}   & 最後に知った目標角をそのまま指令。\keyp{学習なしの基準線} & 使わない \\
+\code{P0} & 模倣学習（特権教師つき、DAgger 1 巡） & なし（端子はゼロ） \\
+\code{P1} & 模倣学習 & \keyp{あり} \\
+\code{P2} & 強化学習（CEM） & なし（端子はゼロ） \\
+\code{P3} & 強化学習（CEM） & \keyp{あり} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent
+方策は入力 8 $\to$ 隠れ 12(tanh) $\to$ 出力 1 の\keyp{121 パラメータ}の残差方策で、
+基底（＝最後に知った目標角）の上に $\pm 40$\,deg の差分を出す。
+1\,kHz で回すこと、将来ノード上で固定小数点にすることを見込んだ規模である。
+
+\subsection{案Eに固有の入力 $\hat a$}
+
+案Dが渡すのは「いま何 µs 古いか」（齢 $a$）だけである。本実験はもう1つ、
+\keyp{「あと何 µs で新しい文脈が来るか」}$\hat a$ を渡す。
+tickless ワンショットタイマは次の起床時刻を持っているので、
+\keyp{OS だけが原理的に答えられる値}である。方策から見れば未来の情報であり、
+「待つ」という行動を選べるかがこの1次元で変わる。
+DA-MDP・世界モデル・遅延ロバスト化のいずれにもない入力である。
+
+\subsection{環境}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item サーボ：位置指令 $\to$ 内部 PD（$\omega=30$\,rad/s, $\zeta=1.0$）、
+        角速度飽和 \code{VMAX}=180\,deg/s、可動域 0--180\,deg、制御周期 1\,ms。
+  \item 上位目標：0.15--0.8\,Hz の滑らかな軌道。サーボ帯域（4.8\,Hz）より十分低いので、
+        \keyp{遅延ゼロなら誤差ほぼ 0 で追える}＝教師が「正解」として機能する。
+  \item 文脈配布：周期 100\,ms（10\,Hz）で生成され、輸送遅延 $d$ を経て届く。
+        齢は $d$ から $d+100$\,ms を鋸歯状に動く。
+  \item \keyp{実物の VLA は使わない}（案Dの発想 ―― 遅延の研究に、遅延を生む実物は要らない）。
+\end{itemize}
+
+\subsection{しきい値を先に宣言する}
+
+後から都合よく選ばないため、\code{sweep.py} の冒頭に固定してある。
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \code{TOL}\,$=2.0$\,deg（可動範囲 50\,deg p-p の 4\,\%）
+  \item $d^{*}_{IL}$ ＝ P1 の rms が \code{TOL} を超える最小の遅延
+  \item $d^{*}_{RL}$ ＝ P3 の rms 中央値が P1 の rms 中央値を下回る最小の遅延
+\end{itemize}
+
+\section{実験系そのものの検証}
+
+測っているものが「齢の効果」でなくなる壊れ方は3つある。
+\code{test\_planE.py} が機械的に検査する（12 項目、\keyp{全通過}）。
+
+\begin{enumerate}[leftmargin=1.8em,itemsep=3pt]
+  \item \prob{容量が揃っていない} $\to$ 測っているのは容量差。
+        4条件のパラメータ数が同一（121）であることを検査する。
+        \keyp{齢なし条件も端子は持ったままゼロを流す}。
+  \item \prob{齢マスクが効いていない} $\to$ 齢なし条件が齢を見てしまう。
+        齢を変えても入力が不変であること、齢あり条件では出力が実際に変わること
+        （$\Delta=-6.85$\,deg）、齢の端子以外は同一であることを検査する。
+  \item \prob{学習と評価が同じ軌道} $\to$ 測っているのは過学習。
+        学習は種 2000 系列、評価は 1000 系列で分離する。
+\end{enumerate}
+
+\noindent
+ほかに、教師が遅延に依らず下界（rms $<0.2$\,deg）であること、
+\code{naive} が遅延とともに単調悪化すること、
+齢の信号が実際に変動し輸送遅延以上であること、
+文脈走査の O(1) 実装が総当たりと一致することを検査する。
+
+\section{実験1：輸送遅延の掃引}
+
+\code{DELAYS=0,50,100,200,400,800 SEEDS=5}。以下はすべて追従誤差 rms（deg）の中央値（5 種）。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{実験1の結果。rms（deg）の中央値}
+\label{tab:e1}
+\begin{tabular}{@{}r rr rr rr@{}}
+\toprule
+\textbf{遅延} & \textbf{teacher} & \textbf{naive} &
+\textbf{P0 模倣・齢なし} & \textbf{P1 模倣・齢あり} &
+\textbf{P2 RL・齢なし} & \textbf{P3 RL・齢あり} \\
+\midrule
+0\,ms   & 0.092 & 3.433 & 0.644 & \textbf{0.378} & 0.248 & 0.265 \\
+50\,ms  & 0.092 & 4.894 & 0.945 & \textbf{0.769} & 0.795 & 0.727 \\
+100\,ms & 0.092 & 6.325 & 1.595 & 1.436 & 1.725 & 1.858 \\
+200\,ms & 0.092 & 9.045 & 3.286 & 3.059 & 3.114 & 3.233 \\
+400\,ms & 0.092 & 13.727 & 7.333 & 8.929 & 6.634 & \textbf{6.456} \\
+800\,ms & 0.092 & 19.100 & 15.938 & 15.860 & 12.381 & \textbf{13.533} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.70\textwidth, height=66mm,
+  xlabel={輸送遅延 $d$ [ms]}, ylabel={追従誤差 rms [deg]},
+  ymode=log, log basis y=10,
+  xmin=-30, xmax=830, ymin=0.07, ymax=30,
+  grid=both, grid style={gray!22},
+  legend style={at={(1.02,1)}, anchor=north west, font=\scriptsize, draw=gray!40},
+  tick label style={font=\scriptsize}, label style={font=\small},
+]
+\addplot[thick,black,dashed,mark=none] coordinates
+  {(0,0.0921)(50,0.0921)(100,0.0921)(200,0.0921)(400,0.0921)(800,0.0921)};
+\addlegendentry{teacher（下界）}
+\addplot[thick,gray,mark=square*,mark size=1.6] coordinates
+  {(0,3.4331)(50,4.8943)(100,6.3253)(200,9.0453)(400,13.7274)(800,19.0998)};
+\addlegendentry{naive}
+\addplot[thick,orange!80!black,mark=o,mark size=1.8] coordinates
+  {(0,0.6445)(50,0.9448)(100,1.5952)(200,3.2861)(400,7.3330)(800,15.9378)};
+\addlegendentry{P0 模倣・齢なし}
+\addplot[thick,red!70!black,mark=*,mark size=1.6] coordinates
+  {(0,0.3778)(50,0.7693)(100,1.4362)(200,3.0589)(400,8.9294)(800,15.8600)};
+\addlegendentry{P1 模倣・齢あり}
+\addplot[thick,blue!45!black,mark=triangle,mark size=2.2] coordinates
+  {(0,0.2476)(50,0.7949)(100,1.7250)(200,3.1141)(400,6.6339)(800,12.3811)};
+\addlegendentry{P2 RL・齢なし}
+\addplot[thick,blue!70!green,mark=triangle*,mark size=2.2] coordinates
+  {(0,0.2648)(50,0.7268)(100,1.8577)(200,3.2331)(400,6.4562)(800,13.5327)};
+\addlegendentry{P3 RL・齢あり}
+\end{axis}
+\end{tikzpicture}
+\caption{遅延に対する追従誤差（対数軸）。学習はどの遅延でも \code{naive} を大きく下回るが、
+teacher には遠い。400\,ms 以上で強化学習（青系）が模倣（赤系）を明確に下回る。}
+\label{fig:e1}
+\end{figure}
+
+\subsection{対応のある比較}
+
+\prob{中央値だけでは、ばらつきに埋もれた差を見分けられない。}
+同じ種どうしで比べ、\keyp{勝った種の数}を併記する。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{同一種での比較。括弧内は5種のうち改善した数}
+\label{tab:paired}
+\begin{tabular}{@{}r lll@{}}
+\toprule
+\textbf{遅延} & \textbf{齢の効果・模倣 P0$\to$P1} & \textbf{齢の効果・RL P2$\to$P3} &
+\textbf{RL 対 模倣 P1$\to$P3} \\
+\midrule
+0\,ms   & \keyp{$-41\,\%$（5/5）} & $+7\,\%$（0/5） & \keyp{$-30\,\%$（5/5）} \\
+50\,ms  & \keyp{$-19\,\%$（5/5）} & $-9\,\%$（4/5） & $-6\,\%$（3/5） \\
+100\,ms & $-10\,\%$（4/5） & $+8\,\%$（2/5） & $+29\,\%$（0/5） \\
+200\,ms & $-7\,\%$（4/5） & $+4\,\%$（2/5） & $+6\,\%$（2/5） \\
+400\,ms & \prob{$+22\,\%$（1/5）} & $-3\,\%$（2/5） & \keyp{$-28\,\%$（5/5）} \\
+800\,ms & $-0.5\,\%$（3/5） & $+9\,\%$（0/5） & \keyp{$-15\,\%$（5/5）} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{読み取り}
+
+\begin{enumerate}[leftmargin=1.8em,itemsep=4pt]
+  \item \keyp{学習は明確に効く。} どの遅延でも \code{naive} を大きく下回る
+        （800\,ms で 19.1 $\to$ 12.4\,deg）。ただし teacher（0.092\,deg）には遠い。
+  \item \keyp{齢は、模倣では小さい遅延で効く。} 0\,ms で $-41\,\%$（5/5）、
+        50\,ms で $-19\,\%$（5/5）。遅延が伸びるほど効果は薄れ、
+        \prob{400\,ms では逆に悪化する}（$+22\,\%$、勝ち 1/5）。
+  \item \prob{強化学習では齢の効果が検出できない。} 勝ち数は 0/5〜4/5 に散らばり、
+        中央値の変化も $\pm 9\,\%$ 以内で、種のばらつきに埋もれている。
+  \item \keyp{大遅延では強化学習が模倣を明確に上回る。}
+        400\,ms で $-28\,\%$（5/5）、800\,ms で $-15\,\%$（5/5）。
+        これは案Eの中心仮説 ――\keyp{教師が失敗する領域は模倣では学べず、そこは強化学習が取る}――
+        を支持する、唯一かつ明瞭な結果である。
+\end{enumerate}
+
+\section{事前に宣言した境界の扱い}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+  \item $d^{*}_{IL}$ ＝ \keyp{200\,ms}（P1 の rms が \code{TOL}$=2.0$\,deg を超える最小の遅延）。
+        宣言どおり機能した。
+  \item \prob{$d^{*}_{RL}$ の定義は機能しなかった。}
+        「P3 が P1 を下回る最小の点」は 0\,ms を返すが、100\,ms と 200\,ms では逆転しており
+        \prob{単調でない}ので、「境界」という語に値しない。
+\end{itemize}
+
+\noindent
+\keyp{定義を後から都合よく変えない。} ここでは事実を書くにとどめる ――
+\keyp{強化学習の優位は 400\,ms 以上で 5/5 種と安定する}。
+次の実験では「$k$ 種すべてで下回る最小の点」という形で\emph{宣言し直して}測る。
+
+\section{この軸では仮説を検定できない（設計上の発見）}
+\label{sec:flaw}
+
+\prob{遅延 $d$ は1回の走行のあいだ一定である。}
+したがって齢 $a$ は「$d$（定数）＋配布周期 100\,ms のなかの位相」であり、
+\keyp{情報として効くのは位相の部分だけ}で、定数 $d$ は学習で重みに吸収される。
+位相の変動幅は $d$ によらず 100\,ms で一定なので、
+\prob{「遅延が大きいほど齢が効く」はこの軸では原理的に出ない}。
+
+実際、齢の効果は $d$ とともに薄れ、400\,ms では
+\keyp{入力がほぼ定数になったぶん、むしろ害になった}（$+22\,\%$）と読める。
+入力を1本増やせば、その情報が使えないとき過学習の材料になるだけである。
+
+\medskip
+\noindent
+案Eの主張は「\keyp{遅延が変動する条件下で}」であった。
+したがって掃引すべき軸は遅延の\emph{大きさ}ではなく\keyp{遅延のばらつき}である。
+実験1は\prob{主張と対応しない軸を掃引していた}ことになる。
+
+\medskip
+\noindent
+これは負の結果ではなく、\keyp{測る前に気づけなかった設計の誤り}である。
+記録しておく価値があるのは、案Dの計画書にも同じ穴があるからである ――
+案Dは遅延を「制御変数として掃引する」と書いているが、
+\keyp{掃引すべきは分布の位置ではなく形（分散）}である。
+案Dの実験計画をこの点で修正する必要がある。
+
+\section{実験2：遅延のばらつきを掃引する}
+\label{sec:e2}
+
+\code{DELAYS=100 JITTERS=0,25,50,100,200 SEEDS=5}（輸送遅延は 100\,ms に固定）。
+ジッタは文脈の生成時刻に $\pm j$ の一様乱数として入る。
+追い越して着いた古い文脈は\keyp{最新優先で捨てる}
+（案Aの「文脈クラスは最新優先で上書き」に対応する方針を実装した）。
+これにより齢の変動幅は $j=0$ の 100\,ms から $j=200$\,ms では \keyp{279\,ms} へ広がり、
+\keyp{齢が定数でなくなる}。
+
+\subsection{予測（結果を見る前に書いたもの）}
+
+\begin{enumerate}[leftmargin=1.8em,itemsep=2pt]
+  \item ジッタが増えるほど\keyp{P1 対 P0 の差が開く}。齢が定数でなくなるため。
+  \item $\hat a$ の効果はジッタで弱まる。次の到着時刻の予測が外れるようになるため。
+  \item 強化学習側（P3 対 P2）でも差が出るなら、齢の効果は学習法に依らないことになる。
+        出ないなら、\prob{CEM の探索が齢を使う解に届いていない}疑いが残る。
+\end{enumerate}
+
+\subsection{結果}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{実験2の結果。rms（deg）の中央値（5 種）。$d=100$\,ms 固定}
+\label{tab:e2}
+\begin{tabular}{@{}r rr rr rr@{}}
+\toprule
+\textbf{ジッタ $j$} & \textbf{teacher} & \textbf{naive} &
+\textbf{P0 模倣・齢なし} & \textbf{P1 模倣・齢あり} &
+\textbf{P2 RL・齢なし} & \textbf{P3 RL・齢あり} \\
+\midrule
+0\,ms   & 0.092 & 6.325 & 1.595 & \textbf{1.436} & 1.725 & 1.858 \\
+25\,ms  & 0.092 & 6.391 & 1.782 & \textbf{1.627} & 1.967 & 2.038 \\
+50\,ms  & 0.092 & 6.561 & 2.083 & \textbf{1.740} & 2.358 & 2.503 \\
+100\,ms & 0.092 & 6.944 & 2.942 & \textbf{2.202} & 3.316 & 2.990 \\
+200\,ms & 0.092 & 7.778 & 4.198 & \textbf{2.765} & 3.612 & 4.191 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.70\textwidth, height=62mm,
+  xlabel={文脈生成のジッタ $j$ [$\pm$ms]}, ylabel={追従誤差 rms [deg]},
+  xmin=-10, xmax=210, ymin=0, ymax=8.4,
+  grid=both, grid style={gray!22},
+  legend style={at={(1.02,1)}, anchor=north west, font=\scriptsize, draw=gray!40},
+  tick label style={font=\scriptsize}, label style={font=\small},
+]
+\addplot[thick,gray,mark=square*,mark size=1.6] coordinates
+  {(0,6.325)(25,6.391)(50,6.561)(100,6.944)(200,7.778)};
+\addlegendentry{naive}
+\addplot[thick,orange!80!black,mark=o,mark size=1.8] coordinates
+  {(0,1.595)(25,1.782)(50,2.083)(100,2.942)(200,4.198)};
+\addlegendentry{P0 模倣・齢なし}
+\addplot[very thick,red!70!black,mark=*,mark size=1.6] coordinates
+  {(0,1.436)(25,1.627)(50,1.740)(100,2.202)(200,2.765)};
+\addlegendentry{P1 模倣・齢あり}
+\addplot[thick,blue!45!black,mark=triangle,mark size=2.2] coordinates
+  {(0,1.725)(25,1.967)(50,2.358)(100,3.316)(200,3.612)};
+\addlegendentry{P2 RL・齢なし}
+\addplot[thick,blue!70!green,mark=triangle*,mark size=2.2] coordinates
+  {(0,1.858)(25,2.038)(50,2.503)(100,2.990)(200,4.191)};
+\addlegendentry{P3 RL・齢あり}
+\end{axis}
+\end{tikzpicture}
+\caption{遅延の\keyp{ばらつき}に対する追従誤差。模倣では齢あり（太い赤）と齢なし（橙）の
+差がジッタとともに単調に開く。実験1（図\ref{fig:e1}）で薄れていったのと逆向きである。}
+\label{fig:e2}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{同一種での比較。齢の効果はジッタとともに\keyp{単調に強まる}}
+\label{tab:paired2}
+\begin{tabular}{@{}r l c l c@{}}
+\toprule
+\textbf{ジッタ} & \textbf{齢の効果・模倣 P0$\to$P1} & \textbf{勝ち} &
+\textbf{齢の効果・RL P2$\to$P3} & \textbf{勝ち} \\
+\midrule
+0\,ms   & $-10.0\,\%$ & 4/5 & $+7.7\,\%$ & 2/5 \\
+25\,ms  & $-8.7\,\%$  & 4/5 & $+3.6\,\%$ & 1/5 \\
+50\,ms  & $-16.4\,\%$ & \keyp{5/5} & $+6.2\,\%$ & 1/5 \\
+100\,ms & $-25.1\,\%$ & \keyp{5/5} & $-9.8\,\%$ & 3/5 \\
+200\,ms & \keyp{$-34.1\,\%$} & \keyp{5/5} & $+16.0\,\%$ & 1/5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{読み取り}
+
+\begin{enumerate}[leftmargin=1.8em,itemsep=4pt]
+  \item \keyp{予測1は的中した。} 齢の効果は $-10\,\% \to -34\,\%$ と\keyp{単調に強まり}、
+        $j\ge 50$\,ms では\keyp{5 種すべてで}齢ありが勝つ。
+        種ごとの差も $-0.05$\,deg 級から $-1.8$\,deg 級へ一桁大きくなる。
+        \prob{齢が効くのは遅延が大きいときではなく、遅延がばらつくときである。}
+  \item 別の見方をすると、齢は\keyp{劣化を食い止める}。
+        \code{naive} 比の改善率は、齢なしが $75\,\% \to 46\,\%$ と崩れていくのに対し、
+        齢ありは $77\,\% \to 64\,\%$ にとどまる。
+        ばらつきが増えるほど、齢を渡すことの価値が上がる。
+  \item \prob{予測3は外れ、強化学習では今回も齢の効果が出なかった}（勝ち 1/5〜3/5、符号も一定しない）。
+        実験1と合わせて、\keyp{CEM が齢を使う解に届いていない}疑いが濃い。
+        121 次元の分布探索で、8 本ある入力のうち 2 本の使い方だけを見つけるのは、
+        勾配を使わない探索には荷が重いという読みが自然である。
+        別のアルゴリズムでの確認が要る。
+  \item \keyp{予測2は検定できなかった。} 本実験は $a$ と $\hat a$ を\prob{同時に}与えており、
+        両者を分離していない。どちらがどれだけ効いているかは
+        アブレーション（$a$ のみ／$\hat a$ のみ／両方）でしか言えない。
+        \prob{これは実験計画の不足であり、次の実験の第一項目にする。}
+\end{enumerate}
+
+\noindent
+なお、この軸でも事前宣言どおり $d^{*}_{IL}$ は測れた ―― \keyp{ジッタ 100\,ms}
+（P1 の rms が \code{TOL}$=2.0$\,deg を超える最小の点）。
+$d^{*}_{RL}$ は掃引範囲では未到達である（P3 は P1 を一度も下回らない）。
+
+\section{限界}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+  \item \prob{1 関節・剛体・摩擦なし}。バックラッシュ、静止摩擦、サーボの応答遅れは入っていない。
+        実機微調整の段階で必ずずれる（案Eの2年目の項目）。
+  \item \prob{\code{VMAX}=180\,deg/s は推定値}でカタログ値ではない（\code{rl/dofbot\_rl.py} と同じ仮定）。
+  \item \prob{強化学習は CEM のみ}。純 Python で回る規模に収めるための選択で、
+        SAC 等との比較は未実施。したがって「強化学習では齢が効かない」は
+        \keyp{CEM では検出できなかった}と読むべきである。
+  \item \prob{$a$ と $\hat a$ を分離していない}。両方を同時に与えているので、
+        案Eに固有の入力である $\hat a$ が単独でどれだけ効くかは\keyp{まだ言えない}。
+        アブレーションが要る（第\ref{sec:next}節の第1項）。
+  \item 模倣と強化学習は学習量を揃えていない（別アルゴリズムなので原理的に揃わない）。
+        厳密な対照は \keyp{P0 対 P1} と \keyp{P2 対 P3} の2組であり、
+        P1 対 P3 は境界の定義にのみ使う。
+  \item \prob{齢は理想的に正確}。実機では OS の計時そのものに誤差がある。
+        外部計測（ロジック・アナライザ）で裏を取る設計は案Eの第3項目にある。
+  \item 課題は\keyp{追従のみ}。「到達して止まる」課題は入っていない。
+        \keyp{「待つ」が最適になるのはそちら}なので、$\hat a$ の効果は過小評価されている可能性が高い。
+\end{itemize}
+
+\section{次の一手}
+\label{sec:next}
+
+\begin{enumerate}[leftmargin=1.8em,itemsep=3pt]
+  \item \keyp{$a$ と $\hat a$ のアブレーション}（4 条件：どちらも無し／$a$ のみ／$\hat a$ のみ／両方）。
+        案Eに固有の入力が単独で効くかは、これでしか言えない。\keyp{最優先}。
+  \item 脱落率 \code{p\_drop}（メールボックス溢れ、\code{cc.c:532}）の軸追加。
+        \keyp{$\hat a$ が外れる条件で何が起きるか}が本題になる。
+        $\hat a$ を「点推定」でなく「上界」として渡すべきかの判断がここで決まる。
+  \item \keyp{到達して止まる課題}の追加。「待つ」が最適解になる課題で $\hat a$ を測り直す。
+        追従課題では $\hat a$ の効果は過小評価されているはずである。
+  \item 強化学習を CEM 以外でも回し、「齢が効かない」が手法固有でないことを確認する。
+        勾配を使う手法なら 2 本の入力の使い方を見つけられるか、という問いである。
+  \item 多関節（隣接関節の齢つき情報をメッシュ経由で受ける）へ拡大する。
+  \item 固定小数点・量子化した方策で同じ実験を回し、案F・案Gの入力にする。
+\end{enumerate}
+
+\section{案D・案Eの計画へ戻すべき修正}
+
+本実験の結果は、計画書の側を2箇所直すことを求める。
+
+\begin{enumerate}[leftmargin=1.8em,itemsep=3pt]
+  \item \prob{掃引すべきは遅延の大きさではなく、ばらつきである。}
+        案D（\code{vla\_rt\_review.pdf}）は「遅延を 0.1\,ms から数百 ms まで変えた軌跡を生成する」
+        と書いているが、\keyp{固定遅延をいくら振っても齢の効果は測れない}
+        （第\ref{sec:flaw}節）。分布の\emph{位置}ではなく\emph{形}を掃引する設計に直す必要がある。
+  \item \keyp{齢の効果の主戦場は大遅延ではなく高ジッタである。}
+        したがって案Dの合格ラインも、遅延の大きさではなくばらつきの関数として書くべきである。
+        実験2で得た $-34\,\%$（$\pm 200$\,ms、5/5 種）が、その最初の目安になる。
+\end{enumerate}
+
+\section*{付録：構成と再現手順}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{\code{xinu-mesh-rtos/planE/}（純 Python、依存ゼロ）}
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+\code{joint.py} & サーボ、上位目標、齢つき文脈配布（脱落・ジッタ・追い越し処理を含む） \\
+\code{policy.py} & 121 パラメータの残差方策、齢マスク、Adam \\
+\code{env.py} & 1 エピソードの実行と、分位点つきの指標 \\
+\code{train.py} & 特権教師つき模倣（DAgger 1 巡）と CEM 強化学習 \\
+\code{sweep.py} & 遅延・ジッタ・脱落率の掃引と要約。しきい値をここで宣言する \\
+\code{test\_planE.py} & 実験系そのものの検証（12 項目） \\
+\code{plot\_data.py} & \code{results/*.csv} を pgfplots 用の表に落とす \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{verbatim}
+python3 test_planE.py                                   # 先にこれを通す
+DELAYS=0,50,100,200,400,800 SEEDS=5 python3 sweep.py
+DELAYS=100 JITTERS=0,25,50,100,200 SEEDS=5 OUT=sweep_jitter python3 sweep.py
+\end{verbatim}
+
+\noindent
+所要はいずれも約 35 分（Apple Silicon、単一プロセス）。
+生データは \code{results/*.csv}、要約は \code{results/*\_summary.md} に出る。
+指標は平均だけでなく p50/p90/p99/max を必ず出す ―― \keyp{集計値は嘘をつく}。
+
+\end{document}
